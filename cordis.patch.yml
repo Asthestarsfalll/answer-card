@@ -1,0 +1,10 @@
+# dsh-answer-card 的 bundle 入口：往 profile 里插入一行 loader 插件。
+# 需要覆盖配置时写进 profile 的 cordis.patch.yml：
+#
+#   - id: answer-card
+#     config:
+#       skipWhenDSHFocused: true
+#       notifyOnComplete: false
+- insert:
+    - id: answer-card
+      name: 'dsh-answer-card'
