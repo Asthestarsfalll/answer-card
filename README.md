@@ -112,9 +112,20 @@ dsh plugin --profile desktop add file:/path/to/dsh-answer-card
 | 弹出时机 | 审批请求 / 模型提问 / 任务完成 / 只在 DSH 不在前台时 |
 | 外观 | 出现位置（中央、四角、上下居中、**光标附近**）、宽度 320–720pt、字号 70%–180%、主色 |
 | 行为 | 自动关闭毫秒数（0 = 一直等）、提示音、**回到 DSH 时移动鼠标指针**、完成提醒最小间隔 |
+| 例外 | 用下拉框把**工作区目录**或**会话**加入排除名单；已排除的条目列在下方，点 × 移出 |
 | 自检 | 「发送测试卡片」按钮，按当前设置弹一张 |
 
 合并顺序是 **默认值 → `cordis.patch.yml` → 设置文件**，设置页改过的值优先；想回到 patch 里的值，删掉 JSON 里对应的键即可。
+
+### 例外：哪些工作区 / 会话不弹
+
+设置页「例外」有两个下拉框，候选是**最近弹过卡的会话和目录**（宿主每次触发前顺手记一笔，只存会话 id、标题、目录和时间，最多 60 条，落在 `$DSH_HOME/dsh-answer-card-recent.json`）。选中点「加入排除」即静音；已排除的条目按分组列在下方并带计数，点 × 移出：
+
+- **工作区**按 `session.header.cwd` **精确匹配**；以 `/` 结尾的条目按前缀匹配（例如 `/Users/me/work/` 覆盖整个目录树，不会误伤 `/Users/me/workshop`）。这样的前缀条目可以直接写进设置文件，下拉框只负责精确目录。
+- **会话**按 `session.id` 精确匹配。
+- 静音只影响「弹不弹卡」，`approval/request` 与 `user-questions/request` 照常往下走，由 DSH 自己的卡片处理，工具不会卡住。
+
+这两组值就是设置文件里的 `mutedWorkspaces` / `mutedSessions`，也可以直接写进 `cordis.patch.yml`。
 
 ## 配置
 
@@ -142,6 +153,8 @@ dsh plugin --profile desktop add file:/path/to/dsh-answer-card
 | `autoDismissMs` | `0` | 卡片自动关闭毫秒数；`0` = 一直等你点。 |
 | `completeCooldownMs` | `10000` | 同一会话两次「完成」提醒的最小间隔。 |
 | `settingsFile` | `''` | 设置文件路径（默认 `$DSH_HOME/dsh-answer-card.json`）。 |
+| `mutedWorkspaces` | `[]` | 不弹卡的目录；末尾带 `/` 表示前缀匹配。 |
+| `mutedSessions` | `[]` | 不弹卡的会话 id。 |
 | `helperPath` | `''` | 自定义助手路径（默认用缓存里按源码哈希命名的编译产物）。 |
 | `traceFile` | `''` | 诊断日志；排查「到底有没有触发」时填一个路径。 |
 
