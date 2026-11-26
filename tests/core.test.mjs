@@ -1,0 +1,726 @@
+import assert from 'node:assert/strict'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import test from 'node:test'
+
+import {
+  approvalRuleKey,
+  buildPermissionOverrides,
+  describeToolCall,
+  formatQuestionReason,
+  handleHookInput,
+  normalizeAskQuestions,
+  passthroughDecision,
+  shouldInterceptApproval,
+} from '../adapters/antigravity/hook.mjs'
+import * as antigravityMcpApp from '../adapters/antigravity/mcp-app.mjs'
+import * as dshAdapter from '../adapters/dsh/index.mjs'
+import { buildAcpPermissionPayload } from '../adapters/zed/acp-proxy.mjs'
+import { parseHelperOutput } from '../core/helper.mjs'
+import { handleToolCall } from '../core/mcp.mjs'
+import { buildApprovalPayload, buildCompletePayload, buildQuestionPayload, mapQuestionAnswers } from '../core/protocol.mjs'
+import { createSettingsRequestHandler } from '../core/settings-server.mjs'
+import {
+  DEFAULT_SETTINGS,
+  HOST_ORDER,
+  isCoolingDown,
+  migrateLegacyHostSettings,
+  muteReasonOf,
+  resolveSettings,
+  writeSettings,
+} from '../core/settings.mjs'
+import {
+  normalizeCssColor,
+  normalizeThemeSnapshot,
+  readZedTheme,
+  resolveHostTheme,
+  stripJsonc,
+  writeHostThemeSnapshot,
+} from '../core/theme.mjs'
+
+function makeTmpDir() {
+  return mkdtempSync(join(tmpdir(), 'answer-card-test-'))
+}
+
+test('settings: normalization, host override, and DSH compatibility', () => {
+  const dir = makeTmpDir()
+  try {
+    const file = join(dir, 'settings.json')
+    writeSettings({ position: 'cursor', width: 999, fontScale: 0.2, accent: '#2FBF71', skipWhenDSHFocused: false }, file)
+    writeSettings({ approvalPolicy: 'commands', width: 520 }, file, 'antigravity')
+
+    const shared = resolveSettings({}, file)
+    assert.equal(shared.position, 'cursor')
+    assert.equal(shared.width, 720)
+    assert.equal(shared.fontScale, 0.7)
+    assert.equal(shared.skipWhenHostFocused, false)
+    assert.equal(shared.skipWhenDSHFocused, false)
+
+    const ag = resolveSettings({}, file, 'antigravity')
+    assert.equal(ag.position, 'cursor')
+    assert.equal(ag.width, 520)
+    assert.equal(ag.approvalPolicy, 'commands')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('settings: mute matching (exact session, exact workspace, prefix workspace) and cooldown', () => {
+  const dir = makeTmpDir()
+  try {
+    const settings = {
+      mutedSessions: ['conv-1'],
+      mutedWorkspaces: ['/Users/me/exact', '/Users/me/work/'],
+    }
+    assert.equal(muteReasonOf({ sessionId: 'conv-1', cwd: '/other' }, settings), 'session')
+    assert.equal(muteReasonOf({ sessionId: 'conv-2', cwd: '/Users/me/exact' }, settings), 'workspace')
+    assert.equal(muteReasonOf({ sessionId: 'conv-2', cwd: '/Users/me/work/sub/repo' }, settings), 'workspace')
+    assert.equal(muteReasonOf({ sessionId: 'conv-2', cwd: '/Users/me/workshop' }, settings), null)
+
+    assert.equal(isCoolingDown('ag:s1', 5000, dir), false)
+    assert.equal(isCoolingDown('ag:s1', 5000, dir), true)
+    assert.equal(isCoolingDown('ag:s2', 5000, dir), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('protocol: question options + custom text mapping and complete follow-up payload', () => {
+  const { groups, payload } = buildQuestionPayload({
+    hostLabel: 'Antigravity',
+    title: 'answer-card',
+    questions: [
+      { id: 'q0', question: 'Pick architecture', options: ['Layered', 'Monolith'] },
+      { id: 'q1', question: 'Extra note', options: [] },
+    ],
+    settings: DEFAULT_SETTINGS,
+  })
+  assert.equal(payload.groups.length, 2)
+  assert.equal(payload.groups[1].input, true)
+
+  const answers = mapQuestionAnswers(groups, {
+    result: 'choose',
+    answers: { q0: ['0'], q1: ['support zed'] },
+    texts: { q0: 'keep DSH working' },
+  })
+  assert.deepEqual(answers[0].selected, ['Layered'])
+  assert.equal(answers[0].custom, 'keep DSH working')
+  assert.equal(answers[1].custom, 'support zed')
+
+  const complete = buildCompletePayload({
+    host: 'antigravity',
+    hostLabel: 'Antigravity',
+    title: 'answer-card',
+    settings: DEFAULT_SETTINGS,
+    allowFollowUp: true,
+  })
+  assert.equal(complete.groups.length, 1)
+  assert.equal(complete.groups[0].optional, true)
+  assert.equal(complete.submit, '回到 Antigravity')
+  assert.equal(complete.submitWhenTyped, '发送到 Antigravity')
+})
+
+test('antigravity hook: approval policy matrix and describeToolCall', () => {
+  const external = { ...DEFAULT_SETTINGS, approvalPolicy: 'external' }
+  assert.equal(shouldInterceptApproval({ name: 'run_command', args: { CommandLine: 'ls -la' } }, external), false)
+  assert.equal(shouldInterceptApproval({ name: 'run_command', args: { CommandLine: 'ls -la', BypassSandbox: true } }, external), true)
+  assert.equal(shouldInterceptApproval({ name: 'run_command', args: { CommandLine: 'git push origin main' } }, external), true)
+  assert.equal(shouldInterceptApproval({ name: 'call_mcp_tool', args: { ServerName: 'gh', ToolName: 'create_pr' } }, external), true)
+  assert.equal(shouldInterceptApproval({ name: 'write_file', args: { Path: '/tmp/a' } }, external), false)
+
+  const mutating = { ...DEFAULT_SETTINGS, approvalPolicy: 'mutating' }
+  assert.equal(shouldInterceptApproval({ name: 'write_file', args: { Path: '/tmp/a' } }, mutating), true)
+
+  const ignored = { ...external, approvalIgnoreTools: ['mcp:gh:create_pr'] }
+  assert.equal(shouldInterceptApproval({ name: 'call_mcp_tool', args: { ServerName: 'gh', ToolName: 'create_pr' } }, ignored), false)
+
+  const desc = describeToolCall({ name: 'run_command', args: { CommandLine: 'git push', BypassSandbox: true, toolSummary: 'Push code' } })
+  assert.equal(desc.toolLabel, 'run_command')
+  assert.match(desc.reason, /BypassSandbox/)
+})
+
+test('antigravity hook: PreToolUse ask_question answered vs fallback', async () => {
+  const dir = makeTmpDir()
+  try {
+    const paths = {
+      settingsFile: join(dir, 'settings.json'),
+      recentFile: join(dir, 'recent.json'),
+      stateDir: join(dir, 'state'),
+    }
+    const baseInput = {
+      hookEventName: 'PreToolUse',
+      conversationId: 'conv-abc',
+      cwd: '/Users/me/proj',
+      toolCall: {
+        name: 'ask_question',
+        args: {
+          questions: [{ question: 'Deploy now?', options: ['Yes', 'No'], is_multi_select: false }],
+        },
+      },
+    }
+
+    // 1. Answered via floating card -> deny with structured [answer-card] reason
+    const answered = await handleHookInput(baseInput, {
+      paths,
+      ensureHelperFn: () => ({ ok: true, helperPath: '/fake/helper' }),
+      isHostFocusedFn: async () => false,
+      showCardFn: async () => ({ result: 'choose', answers: { q0: ['0'] }, texts: { q0: 'staging only' } }),
+    })
+    assert.equal(answered.decision, 'deny')
+    assert.match(answered.reason, /^\[answer-card\]/)
+    assert.match(answered.reason, /Yes/)
+    assert.match(answered.reason, /staging only/)
+
+    // 2. Host focused -> allow (native UI)
+    const focused = await handleHookInput(baseInput, {
+      paths,
+      ensureHelperFn: () => ({ ok: true, helperPath: '/fake/helper' }),
+      isHostFocusedFn: async () => true,
+    })
+    assert.deepEqual(focused, { decision: 'allow' })
+
+    // 3. Dismissed -> allow (native UI fallback)
+    const dismissed = await handleHookInput(baseInput, {
+      paths,
+      ensureHelperFn: () => ({ ok: true, helperPath: '/fake/helper' }),
+      isHostFocusedFn: async () => false,
+      showCardFn: async () => ({ result: 'dismiss' }),
+    })
+    assert.deepEqual(dismissed, { decision: 'allow' })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('antigravity hook: PreToolUse approval allow / deny / dismiss', async () => {
+  const dir = makeTmpDir()
+  try {
+    const paths = {
+      settingsFile: join(dir, 'settings.json'),
+      recentFile: join(dir, 'recent.json'),
+      stateDir: join(dir, 'state'),
+    }
+    const input = {
+      hookEventName: 'PreToolUse',
+      conversationId: 'conv-2',
+      cwd: '/Users/me/proj',
+      toolCall: {
+        name: 'run_command',
+        args: { CommandLine: 'git push', BypassSandbox: true },
+      },
+    }
+
+    const allowRes = await handleHookInput(input, {
+      paths,
+      ensureHelperFn: () => ({ ok: true, helperPath: '/fake' }),
+      isHostFocusedFn: async () => false,
+      showCardFn: async (_h, payload) => {
+        // 原样转发，不附加额外提示文案，并提供 4 个审批选项
+        assert.equal(payload.groups[0].text, '')
+        assert.doesNotMatch(String(payload.message ?? ''), /需要你点头/)
+        assert.deepEqual(payload.groups[0].choices.map((c) => c.id), ['allow', 'allow_session', 'allow_always', 'deny'])
+        return { result: 'choose', answers: { approval: ['allow'] } }
+      },
+    })
+    assert.deepEqual(allowRes, {
+      decision: 'allow',
+      permissionOverrides: ['command(git push)', 'unsandboxed(git push)'],
+    })
+    assert.deepEqual(buildPermissionOverrides({ name: 'call_mcp_tool', args: { ServerName: 'answer-card_settings', ToolName: 'open_answer_card_settings' } }), [
+      'mcp(answer-card_settings/open_answer_card_settings)',
+    ])
+    assert.deepEqual(buildPermissionOverrides({ name: 'edit_file', args: { Path: '/tmp/a.js' } }), [
+      'write_file(/tmp/a.js)',
+    ])
+
+    // allow_session: 同一会话第二次同类调用直接放行，不再弹卡
+    let cardShown = 0
+    const sessionAllow1 = await handleHookInput(input, {
+      paths,
+      ensureHelperFn: () => ({ ok: true, helperPath: '/fake' }),
+      isHostFocusedFn: async () => false,
+      showCardFn: async () => { cardShown += 1; return { result: 'choose', answers: { approval: ['allow_session'] } } },
+    })
+    assert.deepEqual(sessionAllow1, {
+      decision: 'allow',
+      permissionOverrides: ['command(git push)', 'unsandboxed(git push)'],
+    })
+    const sessionAllow2 = await handleHookInput(input, {
+      paths,
+      ensureHelperFn: () => ({ ok: true, helperPath: '/fake' }),
+      isHostFocusedFn: async () => false,
+      showCardFn: async () => { cardShown += 1; return { result: 'dismiss' } },
+    })
+    assert.deepEqual(sessionAllow2, {
+      decision: 'allow',
+      permissionOverrides: ['command(git push)', 'unsandboxed(git push)'],
+    })
+    assert.equal(cardShown, 1)
+
+    // allow_always: 写入 hosts.antigravity.approvalIgnoreTools，跨会话直接放行
+    const alwaysInput = {
+      ...input,
+      conversationId: 'conv-other-session',
+      toolCall: { name: 'call_mcp_tool', args: { ServerName: 'gh', ToolName: 'create_pr' } },
+    }
+    assert.equal(approvalRuleKey(alwaysInput.toolCall), 'mcp:gh:create_pr')
+    assert.equal(approvalRuleKey({ name: 'run_command', args: { CommandLine: 'git push origin main' } }), 'cmd:git push')
+    const alwaysRes1 = await handleHookInput(alwaysInput, {
+      paths,
+      ensureHelperFn: () => ({ ok: true, helperPath: '/fake' }),
+      isHostFocusedFn: async () => false,
+      showCardFn: async () => ({ result: 'choose', answers: { approval: ['allow_always'] } }),
+    })
+    assert.deepEqual(alwaysRes1, {
+      decision: 'allow',
+      permissionOverrides: ['mcp(gh/create_pr)'],
+    })
+    let calledAgain = false
+    const alwaysRes2 = await handleHookInput({ ...alwaysInput, conversationId: 'conv-third' }, {
+      paths,
+      ensureHelperFn: () => ({ ok: true, helperPath: '/fake' }),
+      isHostFocusedFn: async () => false,
+      showCardFn: async () => { calledAgain = true; return { result: 'dismiss' } },
+    })
+    assert.deepEqual(alwaysRes2, {
+      decision: 'allow',
+      permissionOverrides: ['mcp(gh/create_pr)'],
+    })
+    assert.equal(calledAgain, false)
+
+    const denyRes = await handleHookInput({ ...input, conversationId: 'conv-deny' }, {
+      paths,
+      ensureHelperFn: () => ({ ok: true, helperPath: '/fake' }),
+      isHostFocusedFn: async () => false,
+      showCardFn: async (_h, payload) => {
+        assert.equal(payload.allowText, true)
+        return { result: 'choose', answers: { approval: ['deny'] }, texts: { approval: 'use npm run lint instead' } }
+      },
+    })
+    assert.equal(denyRes.decision, 'deny')
+    assert.match(denyRes.reason, /use npm run lint instead/)
+
+    // 不点选项、仅输入替代指令直接提交 -> 也视为 deny 并附带指令
+    const textOnlyDeny = await handleHookInput({ ...input, conversationId: 'conv-deny-text' }, {
+      paths,
+      ensureHelperFn: () => ({ ok: true, helperPath: '/fake' }),
+      isHostFocusedFn: async () => false,
+      showCardFn: async () => ({ result: 'choose', answers: { approval: [] }, texts: { approval: 'skip push for now' } }),
+    })
+    assert.equal(textOnlyDeny.decision, 'deny')
+    assert.match(textOnlyDeny.reason, /skip push for now/)
+
+    const dismissRes = await handleHookInput({ ...input, conversationId: 'conv-dismiss' }, {
+      paths,
+      ensureHelperFn: () => ({ ok: true, helperPath: '/fake' }),
+      isHostFocusedFn: async () => false,
+      showCardFn: async () => ({ result: 'dismiss' }),
+    })
+    assert.deepEqual(dismissRes, { decision: 'ask' })
+
+    // Passthrough decisions never return empty {} (Antigravity PreToolUse requires explicit decision)
+    assert.deepEqual(passthroughDecision({ name: 'run_command', args: { CommandLine: 'ls -la' } }, {}), { decision: 'allow' })
+    assert.deepEqual(passthroughDecision({ name: 'run_command', args: { CommandLine: 'ls -la', BypassSandbox: true } }, {}), { decision: 'ask' })
+    assert.deepEqual(passthroughDecision({ name: 'call_mcp_tool', args: {} }, {}), { decision: 'ask' })
+    assert.deepEqual(passthroughDecision({ name: 'edit_file', args: { Path: '/ws/a.js' } }, { workspacePaths: ['/ws'] }), { decision: 'allow' })
+    assert.deepEqual(passthroughDecision({ name: 'edit_file', args: { Path: '/etc/hosts' } }, { workspacePaths: ['/ws'] }), { decision: 'ask' })
+    // 工作区外文件写入独立生成 external 规则键，不被工作区内 write_file/edit_file 放行规则误吞
+    assert.equal(approvalRuleKey({ name: 'edit_file', args: { Path: '/etc/hosts' } }, { workspacePaths: ['/ws'] }), 'edit_file:external:/etc/hosts')
+    assert.equal(shouldInterceptApproval({ name: 'edit_file', args: { Path: '/etc/hosts' } }, { approvalPolicy: 'external', approvalIgnoreTools: ['edit_file'] }, { workspacePaths: ['/ws'] }), true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('antigravity mcp-app: capabilities, entrypoints, per-host vs shared settings persistence', async () => {
+  const dir = makeTmpDir()
+  try {
+    const settingsFile = join(dir, 'settings.json')
+    const recentFile = join(dir, 'recent.json')
+    const opts = { settingsFile, recentFile }
+
+    const init = await antigravityMcpApp.dispatchRpc({ jsonrpc: '2.0', id: 1, method: 'initialize' }, opts)
+    assert.ok(init.result.capabilities.resources)
+    assert.ok(init.result.capabilities.tools)
+
+    const toolsRes = await antigravityMcpApp.dispatchRpc({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, opts)
+    const openTool = toolsRes.result.tools.find((t) => t.name === 'open_answer_card_settings')
+    assert.equal(openTool._meta.ui.resourceUri, antigravityMcpApp.APP_URI)
+    assert.equal(openTool._meta['com.google.antigravity/ui'].entrypoints.length, 2)
+
+    const appOnlyTool = toolsRes.result.tools.find((t) => t.name === 'app_save_settings')
+    assert.deepEqual(appOnlyTool._meta.ui.visibility, ['app'])
+
+    // Save independent returnCommand per host + shared width
+    await antigravityMcpApp.handleToolCall('app_save_settings', {
+      scope: 'shared',
+      host: 'antigravity',
+      patch: { width: 512, position: 'cursor' },
+    }, opts)
+    await antigravityMcpApp.handleToolCall('app_save_settings', {
+      scope: 'host',
+      host: 'antigravity',
+      patch: { returnCommand: 'open -a Antigravity', mutedSessions: ['conv-99'] },
+    }, opts)
+    await antigravityMcpApp.handleToolCall('app_save_settings', {
+      scope: 'host',
+      host: 'zed',
+      patch: { returnCommand: '' },
+    }, opts)
+
+    const agState = antigravityMcpApp.buildState('antigravity', opts)
+    const zedState = antigravityMcpApp.buildState('zed', opts)
+    assert.equal(agState.effective.width, 512)
+    assert.equal(zedState.effective.width, 512)
+    assert.equal(agState.effective.returnCommand, 'open -a Antigravity')
+    assert.equal(zedState.effective.returnCommand, '')
+    assert.deepEqual(agState.effective.mutedSessions, ['conv-99'])
+    assert.deepEqual(zedState.effective.mutedSessions, [])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('antigravity hook: Stop follow-up continuation vs activate host vs loop guard', async () => {
+  const dir = makeTmpDir()
+  try {
+    const paths = {
+      settingsFile: join(dir, 'settings.json'),
+      recentFile: join(dir, 'recent.json'),
+      stateDir: join(dir, 'state'),
+    }
+    writeSettings({ completeCooldownMs: 0 }, paths.settingsFile)
+
+    // Follow-up text -> continue
+    const cont = await handleHookInput({
+      hookEventName: 'Stop',
+      conversationId: 'conv-stop-1',
+      cwd: '/Users/me/proj',
+      terminationReason: 'NO_TOOL_CALL',
+      continuationActive: false,
+    }, {
+      paths,
+      ensureHelperFn: () => ({ ok: true, helperPath: '/fake' }),
+      isHostFocusedFn: async () => false,
+      showCardFn: async () => ({ result: 'choose', answers: { followup: ['run tests too'] }, texts: { followup: 'run tests too' } }),
+    })
+    assert.equal(cont.decision, 'continue')
+    assert.match(cont.reason, /run tests too/)
+
+    // Empty submit -> activate Antigravity
+    let activated = false
+    const act = await handleHookInput({
+      hookEventName: 'Stop',
+      conversationId: 'conv-stop-2',
+      cwd: '/Users/me/proj',
+      terminationReason: 'NO_TOOL_CALL',
+      continuationActive: false,
+    }, {
+      paths,
+      ensureHelperFn: () => ({ ok: true, helperPath: '/fake' }),
+      isHostFocusedFn: async () => false,
+      showCardFn: async () => ({ result: 'choose', answers: { followup: [] }, texts: {} }),
+      activateHostFn: () => { activated = true },
+    })
+    assert.deepEqual(act, {})
+    assert.equal(activated, true)
+
+    // continuationActive guard -> skip
+    const skipped = await handleHookInput({
+      hookEventName: 'Stop',
+      conversationId: 'conv-stop-3',
+      terminationReason: 'NO_TOOL_CALL',
+      continuationActive: true,
+    }, {
+      paths,
+      ensureHelperFn: () => { throw new Error('should not run') },
+    })
+    assert.deepEqual(skipped, {})
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('helper output parser, DSH adapter compatibility, Zed ACP payload, and MCP validation', async () => {
+  assert.deepEqual(parseHelperOutput('noise\n{"result":"choose","answers":{"a":["1"]}}\n'), {
+    result: 'choose',
+    answers: { a: ['1'] },
+  })
+  assert.deepEqual(parseHelperOutput('not json'), { result: 'error' })
+
+  assert.equal(typeof dshAdapter.apply, 'function')
+  assert.equal(dshAdapter.muteReasonOf({ session: { id: 's1', header: { cwd: '/a/b' } } }, { mutedWorkspaces: ['/a/'] }), 'workspace')
+
+  const acpPayload = buildAcpPermissionPayload({
+    cwd: '/Users/me/zed-app',
+    toolCall: { title: 'Run cargo test' },
+    options: [
+      { optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
+      { optionId: 'reject_once', name: 'Reject', kind: 'reject_once' },
+    ],
+  }, DEFAULT_SETTINGS)
+  assert.equal(acpPayload.kicker, 'Zed')
+  assert.equal(acpPayload.groups[0].text, '')
+  assert.equal(acpPayload.groups[0].choices.length, 2)
+
+  assert.equal(normalizeAskQuestions([{ question: 'Q?', options: ['A'], is_multi_select: true }])[0].multiSelect, true)
+  assert.match(formatQuestionReason([{ id: 'q0', question: 'Q?', selected: ['A'] }]), /Q\? => A/)
+
+    const mcpErr = await handleToolCall('unknown_tool', {})
+  assert.equal(mcpErr.isError, true)
+  assert.ok(buildApprovalPayload({ host: 'antigravity', hostLabel: 'Antigravity', title: 't', toolName: 'run_command', settings: DEFAULT_SETTINGS }))
+})
+
+
+test('settings: legacy host migration splits shared and host scopes', () => {
+  const dir = makeTmpDir()
+  try {
+    const unified = join(dir, 'settings.json')
+    const legacy = join(dir, 'dsh-answer-card.json')
+    writeFileSync(unified, JSON.stringify({ sound: true, hosts: { antigravity: { approvalPolicy: 'all' } } }))
+    writeFileSync(legacy, JSON.stringify({
+      sound: false,
+      position: 'cursor',
+      returnCommand: 'open -a "DSH Desktop"',
+      mutedSessions: ['s1'],
+      completeCooldownMs: 12000,
+    }))
+
+    assert.equal(migrateLegacyHostSettings('dsh', legacy, unified), true)
+    const raw = JSON.parse(readFileSync(unified, 'utf8'))
+    assert.equal(raw.hosts.dsh.returnCommand, 'open -a "DSH Desktop"')
+    assert.deepEqual(raw.hosts.dsh.mutedSessions, ['s1'])
+    assert.equal(raw.hosts.dsh.completeCooldownMs, 12000)
+    assert.equal(raw.hosts.dsh.sound, false)
+    // 共享键不能塞进宿主覆写，否则会挡住全局设置。
+    assert.equal(raw.hosts.dsh.position, undefined)
+    assert.equal(raw.sound, true)
+    // 迁移只发生一次。
+    assert.equal(migrateLegacyHostSettings('dsh', legacy, unified), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('mcp-app: host list and capabilities are data-driven', () => {
+  const dir = makeTmpDir()
+  try {
+    const settingsFile = join(dir, 'settings.json')
+    writeFileSync(settingsFile, JSON.stringify({ hosts: {} }))
+    const state = antigravityMcpApp.buildState('dsh', {
+      settingsFile,
+      recentFile: join(dir, 'recent.json'),
+      stateDir: join(dir, 'state'),
+    })
+    assert.deepEqual(state.hosts.map((h) => h.id), HOST_ORDER)
+    const dsh = state.hosts.find((h) => h.id === 'dsh')
+    const ag = state.hosts.find((h) => h.id === 'antigravity')
+    assert.equal(dsh.capabilities.approvalPolicy, false)
+    assert.equal(dsh.capabilities.returnCommand, true)
+    assert.equal(ag.capabilities.approvalPolicy, true)
+    assert.equal(ag.capabilities.quickFollowUp, true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('theme: dynamic adaptive resolution (live snapshot, Zed JSONC + custom theme, manual override)', async () => {
+  const { mkdirSync, writeFileSync } = await import('node:fs')
+  const dir = makeTmpDir()
+  try {
+    assert.equal(normalizeCssColor('#abc'), '#AABBCC')
+    assert.equal(normalizeCssColor('rgb(26, 115, 232)'), '#1A73E8')
+    assert.equal(normalizeCssColor('#112233ff'), '#112233')
+    // 半透明暗色叠加在浅暖背景 #F8F0DC 上应混合成柔和浅色，绝不能截断成纯黑 #0A0A0C
+    assert.equal(normalizeCssColor('rgba(10, 10, 12, 0.06)', '#F8F0DC'), '#EAE2D0')
+    assert.equal(normalizeCssColor('#0A0A0C1F', '#F8F0DC'), '#DBD4C3')
+    assert.equal(normalizeCssColor('rgba(0, 0, 0, 0)', '#F8F0DC'), undefined)
+    assert.deepEqual(JSON.parse(stripJsonc('{ /* c */ "a": 1, // line\n }')), { a: 1 })
+
+    // 1. Live Antigravity hostContext snapshot (light mode with translucent surface/border)
+    const stateDir = join(dir, 'state')
+    writeHostThemeSnapshot('antigravity', {
+      theme: 'light',
+      variables: {
+        '--color-background-primary': '#F8F0DC',
+        '--color-background-secondary': 'rgba(10, 10, 12, 0.06)',
+        '--color-border-primary': 'rgba(10, 10, 12, 0.14)',
+        '--color-text-primary': '#5C6A72',
+        '--color-ring-primary': '#4E7525',
+      },
+    }, stateDir)
+    const agLight = resolveHostTheme({ host: 'antigravity', settings: { themeMode: 'auto', accent: '' }, stateDir, systemAppearance: 'dark' })
+    assert.equal(agLight.mode, 'light')
+    assert.equal(agLight.background, '#F8F0DC')
+    assert.equal(agLight.surface, '#EAE2D0')
+    assert.equal(agLight.border, '#D7D0BF')
+    assert.equal(agLight.accent, '#4E7525')
+
+    // 1b. DSH reports its real CSS alias tokens (bg-base/bg-l1, dark marker → mode dark).
+    const dshSnapshot = normalizeThemeSnapshot({
+      mode: 'dark',
+      variables: {
+        '--dsw-alias-bg-base': '#151517',
+        '--dsw-alias-bg-l1': '#232325',
+        '--dsw-alias-border-primary': '#333537',
+        '--dsw-alias-label-primary': '#F5F5F7',
+        '--dsw-alias-label-tertiary': '#A1A1A6',
+        '--dsw-alias-brand-primary': '#F5222D',
+      },
+    })
+    assert.equal(dshSnapshot.mode, 'dark')
+    assert.equal(dshSnapshot.background, '#151517')
+    assert.equal(dshSnapshot.surface, '#232325')
+    assert.equal(dshSnapshot.textPrimary, '#F5F5F7')
+    assert.equal(dshSnapshot.accent, '#F5222D')
+    writeHostThemeSnapshot('dsh', dshSnapshot, stateDir)
+    const dshDark = resolveHostTheme({ host: 'dsh', settings: { themeMode: 'auto', accent: '' }, stateDir, systemAppearance: 'light' })
+    assert.equal(dshDark.mode, 'dark')
+    assert.equal(dshDark.background, '#151517')
+    assert.equal(dshDark.textPrimary, '#F5F5F7')
+
+    // 1c. 旧版 DSH 客户端只上报文字色时，用文字亮度推断主题，不能退回系统外观。
+    const dshLegacy = normalizeThemeSnapshot({
+      textPrimary: '#152443',
+      textSecondary: '#81858C',
+      accent: '#F5222D',
+    })
+    assert.equal(dshLegacy.mode, 'light')
+
+    // 2. Manual dark override + custom accent
+    const agManual = resolveHostTheme({ host: 'antigravity', settings: { themeMode: 'dark', accent: '#FF6600' }, stateDir })
+    assert.equal(agManual.mode, 'dark')
+    assert.equal(agManual.accent, '#FF6600')
+
+    // 3. Zed JSONC settings + custom theme file
+    const zedDir = join(dir, 'zed')
+    mkdirSync(join(zedDir, 'themes'), { recursive: true })
+    writeFileSync(join(zedDir, 'settings.json'), '{\n  // comment\n  "theme": { "mode": "light", "light": "My Soft Light", "dark": "One Dark", },\n}\n')
+    writeFileSync(join(zedDir, 'themes', 'soft.json'), JSON.stringify({
+      themes: [{
+        name: 'My Soft Light',
+        appearance: 'light',
+        style: {
+          'panel.background': '#FAF8F5',
+          'element.background': '#EFECE6',
+          border: '#DDD8CE',
+          text: '#222222',
+          'text.muted': '#666666',
+          'text.accent': '#0A66C2',
+          created: '#2E7D32',
+        },
+      }],
+    }))
+    const zedRaw = readZedTheme({ zedConfigDir: zedDir, systemAppearance: 'dark' })
+    assert.equal(zedRaw.mode, 'light')
+    assert.equal(zedRaw.background, '#FAF8F5')
+    assert.equal(zedRaw.accent, '#0A66C2')
+
+    const zedResolved = resolveHostTheme({ host: 'zed', settings: { themeMode: 'auto', accent: '' }, stateDir, zedConfigDir: zedDir })
+    assert.equal(zedResolved.mode, 'light')
+    assert.equal(zedResolved.background, '#FAF8F5')
+    assert.equal(zedResolved.accent, '#0A66C2')
+
+    // 3b. Zed installed extension blur theme (transparent panel.background skipped, flat surface derived)
+    const zedExtRoot = join(dir, 'zed-extensions')
+    mkdirSync(join(zedExtRoot, 'everforest', 'themes'), { recursive: true })
+    writeFileSync(join(zedDir, 'settings.json'), '{\n  "theme": { "mode": "system", "light": "Everforest Light Soft (blur)", "dark": "One Dark" }\n}\n')
+    writeFileSync(join(zedExtRoot, 'everforest', 'themes', 'everforest-blur.json'), JSON.stringify({
+      themes: [{
+        name: 'Everforest Light Soft (blur)',
+        appearance: 'light',
+        style: {
+          'elevated_surface.background': '#f3ead3',
+          'panel.background': '#f3ead300',
+          'element.background': '#f3ead3',
+          border: '#e5dfc5',
+          text: '#5c6a72',
+          'text.muted': '#939f91',
+          'text.accent': '#8da101',
+          created: '#8da101',
+        },
+      }],
+    }))
+    const zedExtResolved = resolveHostTheme({
+      host: 'zed',
+      settings: { themeMode: 'auto', accent: '' },
+      stateDir,
+      systemAppearance: 'light',
+      zedConfigDir: zedDir,
+      zedExtensionsDir: zedExtRoot,
+    })
+    assert.equal(zedExtResolved.mode, 'light')
+    assert.equal(zedExtResolved.background, '#F3EAD3')
+    assert.notEqual(zedExtResolved.surface, '#F3EAD3')
+    assert.equal(zedExtResolved.accent, '#8DA101')
+
+    // 4. Unknown future harness works cleanly without touching core/
+    const customHarness = resolveHostTheme({ host: 'claude-code', settings: { themeMode: 'auto', accent: '' }, stateDir, systemAppearance: 'light' })
+    assert.equal(customHarness.mode, 'light')
+    assert.equal(customHarness.background, '#FFFFFF')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('settings-server & mcp settings tool: serves shared UI, enforces CSRF token, and persists host settings', async () => {
+  const { EventEmitter } = await import('node:events')
+  const dir = makeTmpDir()
+  try {
+    const settingsFile = join(dir, 'settings.json')
+    const stateDir = join(dir, 'state')
+    const { handler, token } = createSettingsRequestHandler({ host: 'zed', settingsFile, stateDir })
+
+    const invoke = (method, url, headers = {}, body = null) => new Promise((resolve) => {
+      const req = Object.assign(new EventEmitter(), { method, url, headers })
+      let status = 200
+      let resHeaders = {}
+      const chunks = []
+      const res = {
+        writeHead(code, h = {}) { status = code; resHeaders = h },
+        end(data = '') {
+          chunks.push(Buffer.from(String(data)))
+          resolve({ status, headers: resHeaders, text: Buffer.concat(chunks).toString('utf8') })
+        },
+      }
+      handler(req, res)
+      if (body !== null) req.emit('data', Buffer.from(JSON.stringify(body)))
+      req.emit('end')
+    })
+
+    const home = await invoke('GET', '/')
+    assert.equal(home.status, 200)
+    assert.match(home.text, /answer-card-settings/)
+    assert.match(home.text, /\/ui\.js/)
+
+    const uiJs = await invoke('GET', '/ui.js')
+    assert.equal(uiJs.status, 200)
+    assert.match(uiJs.text, /answer-card-settings/)
+
+    // Missing CSRF token -> 403
+    const denied = await invoke('POST', '/app', {}, { name: 'app_get_state', args: { host: 'zed' } })
+    assert.equal(denied.status, 403)
+
+    // Valid token -> saves Zed override and reads it back
+    const saved = await invoke('POST', '/app', { 'x-answer-card-token': token }, {
+      name: 'app_save_settings',
+      args: { host: 'zed', scope: 'host', patch: { returnCommand: 'open -a Zed' } },
+    })
+    assert.equal(saved.status, 200)
+    assert.equal(JSON.parse(saved.text).ok, true)
+
+    const mcpGet = await handleToolCall('answer_card_settings', { action: 'get' }, { settingsFile })
+    const mcpData = JSON.parse(mcpGet.content[0].text)
+    assert.equal(mcpData.effective.returnCommand, 'open -a Zed')
+
+    const mcpSet = await handleToolCall('answer_card_settings', {
+      action: 'set',
+      scope: 'host',
+      patch: { sound: true },
+    }, { settingsFile })
+    assert.equal(JSON.parse(mcpSet.content[0].text).settings.sound, true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

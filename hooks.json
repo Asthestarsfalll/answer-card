@@ -1,0 +1,23 @@
+{
+  "answer-card": {
+    "PreToolUse": [
+      {
+        "matcher": "ask_question|run_command|call_mcp_tool|write_file|edit_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./adapters/antigravity/run-hook.sh",
+            "timeout": 180
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "./adapters/antigravity/run-hook.sh",
+        "timeout": 180
+      }
+    ]
+  }
+}

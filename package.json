@@ -1,0 +1,86 @@
+{
+  "name": "answer-card",
+  "version": "1.0.0",
+  "description": "macOS floating answer card for AI coding agents (Antigravity, DeepSeek Harness, Zed): approve tool calls, answer questions, and jump back or follow up from an always-on-top window.",
+  "type": "module",
+  "main": "./adapters/dsh/index.mjs",
+  "exports": {
+    ".": "./adapters/dsh/index.mjs",
+    "./client": "./adapters/dsh/client.bundle.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./core/helper": "./core/helper.mjs",
+    "./core/settings": "./core/settings.mjs",
+    "./core/protocol": "./core/protocol.mjs",
+    "./core/mcp": "./core/mcp.mjs",
+    "./antigravity": "./adapters/antigravity/hook.mjs",
+    "./zed/acp-proxy": "./adapters/zed/acp-proxy.mjs",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "answer-card": "./core/cli.mjs",
+    "answer-card-mcp": "./core/mcp.mjs"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "check": "node --check core/*.mjs adapters/antigravity/hook.mjs adapters/antigravity/mcp-app.mjs adapters/dsh/index.mjs adapters/dsh/client.js adapters/dsh/client.bundle.js adapters/dsh/build-client.mjs adapters/shared/ui/settings-element.mjs adapters/shared/ui/build.mjs adapters/zed/acp-proxy.mjs",
+    "build:ui": "node adapters/shared/ui/build.mjs && node adapters/dsh/build-client.mjs && node adapters/antigravity/ui/build.mjs",
+    "compile": "node core/cli.mjs compile"
+  },
+  "files": [
+    "plugin.json",
+    "hooks.json",
+    "mcp_config.json",
+    "rules",
+    "skills",
+    "assets",
+    "core",
+    "adapters",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "antigravity",
+    "antigravity-plugin",
+    "dsh",
+    "dsh-plugin",
+    "zed",
+    "mcp",
+    "acp",
+    "macos",
+    "floating-window",
+    "approval"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "slots"
+      ],
+      "external": [
+        "react"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "author": "Asthestarsfalll",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Asthestarsfalll/answer-card.git"
+  },
+  "homepage": "https://github.com/Asthestarsfalll/answer-card#readme",
+  "bugs": {
+    "url": "https://github.com/Asthestarsfalll/answer-card/issues"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/ext-apps": "^2.0.4",
+    "esbuild": "^0.28.2"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "settings": {
+      "command": "/bin/sh",
+      "args": [
+        "${PLUGIN_ROOT}/adapters/antigravity/run-mcp.sh",
+        "--data-dir=${PLUGIN_DATA}"
+      ]
+    }
+  }
+}

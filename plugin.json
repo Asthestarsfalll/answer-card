@@ -1,0 +1,21 @@
+{
+  "name": "answer-card",
+  "displayName": "Answer Card",
+  "description": "macOS topmost floating card for Antigravity: approve tool calls, answer agent questions, and jump back or follow up on turn completion without switching windows.",
+  "version": "1.0.0",
+  "logo": "assets/logo.svg",
+  "author": {
+    "name": "Asthestarsfalll",
+    "url": "https://github.com/Asthestarsfalll"
+  },
+  "homepage": "https://github.com/Asthestarsfalll/answer-card",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Asthestarsfalll/answer-card.git"
+  },
+  "suggestedPrompts": [
+    "发送一张 Answer Card 测试卡片，检查悬浮窗位置和样式",
+    "把 Answer Card 悬浮窗改成光标附近弹出，宽度 500，开启提示音",
+    "把当前工作区加入 Answer Card 静音列表，或查看当前所有设置"
+  ]
+}
