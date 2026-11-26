@@ -17,7 +17,8 @@ import {
 import * as antigravityMcpApp from '../adapters/antigravity/mcp-app.mjs'
 import * as dshAdapter from '../adapters/dsh/index.mjs'
 import { buildAcpPermissionPayload } from '../adapters/zed/acp-proxy.mjs'
-import { parseHelperOutput } from '../core/helper.mjs'
+import { createBridgeRequestHandler, encodeBridgeHelperPath, parseBridgeHelperPath, resolveBridgeTarget } from '../core/bridge.mjs'
+import { ensureHelper, parseHelperOutput } from '../core/helper.mjs'
 import { handleToolCall } from '../core/mcp.mjs'
 import { buildApprovalPayload, buildCompletePayload, buildQuestionPayload, mapQuestionAnswers } from '../core/protocol.mjs'
 import { createSettingsRequestHandler } from '../core/settings-server.mjs'
@@ -720,6 +721,98 @@ test('settings-server & mcp settings tool: serves shared UI, enforces CSRF token
       patch: { sound: true },
     }, { settingsFile })
     assert.equal(JSON.parse(mcpSet.content[0].text).settings.sound, true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('bridge: auto target detection, Bearer auth, local theme merge, and safe activate', async () => {
+  const { EventEmitter } = await import('node:events')
+  const dir = makeTmpDir()
+  try {
+    const tokenFile = join(dir, 'bridge-token')
+    writeFileSync(tokenFile, 'secret-token-123\n')
+    const settingsFile = join(dir, 'settings.json')
+    writeSettings({ position: 'cursor', width: 520, sound: true }, settingsFile)
+    writeSettings({ returnCommand: 'open -a Antigravity' }, settingsFile, 'antigravity')
+
+    // Non-macOS with token auto-detects local SSH reverse-forwarded bridge
+    const linuxTarget = resolveBridgeTarget({ platform: 'linux', tokenFile, bridgePort: 19876 })
+    assert.deepEqual(linuxTarget, { url: 'http://127.0.0.1:19876', token: 'secret-token-123' })
+    assert.equal(resolveBridgeTarget({ platform: 'darwin', tokenFile }), null)
+    assert.equal(resolveBridgeTarget({ platform: 'linux', tokenFile, bridgeUrl: 'off' }), null)
+    assert.equal(parseBridgeHelperPath(encodeBridgeHelperPath('http://127.0.0.1:19876/')), 'http://127.0.0.1:19876')
+
+    const ensuredBridge = ensureHelper({ bridgeUrl: 'http://127.0.0.1:19876', bridgeToken: 'secret-token-123' })
+    assert.equal(ensuredBridge.ok, true)
+    assert.equal(ensuredBridge.mode, 'bridge')
+    assert.equal(ensuredBridge.helperPath, 'bridge://http://127.0.0.1:19876')
+
+    let shownPayload = null
+    let activatedArgs = null
+    const { handler } = createBridgeRequestHandler({
+      token: 'secret-token-123',
+      settingsFile,
+      stateDir: join(dir, 'state'),
+      ensureHelperFn: () => ({ ok: true, helperPath: '/fake/mac-helper' }),
+      probeFrontmostFn: async () => ({ bundleId: 'com.google.Chrome', name: 'Google Chrome' }),
+      withCardLockFn: (fn) => fn(),
+      showCardFn: async (_h, payload) => {
+        shownPayload = payload
+        return { result: 'choose', answers: { approval: ['allow'] } }
+      },
+      activateHostFn: (opts) => { activatedArgs = opts },
+    })
+
+    const invoke = (method, url, headers = {}, body = null) => new Promise((resolve) => {
+      const req = Object.assign(new EventEmitter(), { method, url, headers })
+      let status = 200
+      const chunks = []
+      const res = {
+        writeHead(code) { status = code },
+        end(data = '') {
+          chunks.push(Buffer.from(String(data)))
+          resolve({ status, data: JSON.parse(Buffer.concat(chunks).toString('utf8')) })
+        },
+      }
+      handler(req, res)
+      if (body !== null) req.emit('data', Buffer.from(JSON.stringify(body)))
+      req.emit('end')
+    })
+
+    const health = await invoke('GET', '/health')
+    assert.equal(health.status, 200)
+    assert.equal(health.data.service, 'answer-card-bridge')
+
+    // Unauthorized blocked
+    const unauth = await invoke('POST', '/probe', {}, {})
+    assert.equal(unauth.status, 403)
+
+    const authHeaders = { authorization: 'Bearer secret-token-123' }
+    const probe = await invoke('POST', '/probe', authHeaders, {})
+    assert.equal(probe.status, 200)
+    assert.equal(probe.data.frontmost.bundleId, 'com.google.Chrome')
+
+    // /card merges local Mac visual settings (position, width, sound)
+    const cardRes = await invoke('POST', '/card', authHeaders, {
+      host: 'antigravity',
+      payload: { kind: 'approval', title: 'rm75', groups: [] },
+    })
+    assert.equal(cardRes.status, 200)
+    assert.equal(cardRes.data.outcome.result, 'choose')
+    assert.equal(shownPayload.position, 'cursor')
+    assert.equal(shownPayload.width, 520)
+    assert.equal(shownPayload.sound, true)
+
+    // /activate ignores untrusted remote returnCommand and uses Mac's local setting
+    const actRes = await invoke('POST', '/activate', authHeaders, {
+      host: 'antigravity',
+      returnCommand: 'rm -rf /should-never-run',
+      windowHints: ['rm75'],
+    })
+    assert.equal(actRes.status, 200)
+    assert.equal(activatedArgs.returnCommand, 'open -a Antigravity')
+    assert.deepEqual(activatedArgs.windowHints, ['rm75'])
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

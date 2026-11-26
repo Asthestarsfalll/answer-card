@@ -60,6 +60,7 @@ answer-card/
 │   ├── settings.mjs                              # 统一配置（全局 + hosts.<id> 覆写）、静音、冷却
 │   ├── theme.mjs                                 # 跨宿主动态主题解析（快照 / Zed 扩展 / 系统外观）
 │   ├── protocol.mjs                              # 审批 / 提问 / 完成 / 测试卡片载荷构造
+│   ├── bridge.mjs                                # 远程 SSH 反向转发桥接（服务端自动启动 + 客户端）
 │   ├── settings-server.mjs                       # 本地 127.0.0.1 可视化设置页服务（Zed / CLI 复用）
 │   ├── mcp.mjs                                   # 通用 stdio MCP Server（Zed / 跨宿主复用）
 │   └── cli.mjs                                   # 通用设置、静音、测试与本地设置页 CLI
@@ -160,6 +161,27 @@ Zed 通过共享 `core/` 提供原生 MCP Server（以及可选的 ACP Proxy）�
 - `answer_card_settings`：在 Zed 对话中直接读取 / 修改配置或发送测试卡片。
 
 > 若需要拦截外部 ACP Agent 的原生权限请求，还可在 `agent_servers` 中用 `adapters/zed/acp-proxy.sh -- <acp-agent>` 包装（详见 [adapters/zed/README.md](adapters/zed/README.md)）。
+
+---
+
+### 4. 远程 SSH 会话支持（Linux 服务器 → 本机 Mac 弹窗）
+
+本机 macOS 启用 Antigravity / Zed 插件时会自动监听 `127.0.0.1:19876`（带随机 Bearer Token，强制使用本机 Mac 外观/主题与 `returnCommand`，绝不执行远端传入命令）。让远程 SSH 主机也支持本机弹卡只需两步：
+
+1. **在 `~/.ssh/config` 给目标主机加一行反向转发**：
+
+```sshconfig
+Host your-remote-host
+  RemoteForward 19876 127.0.0.1:19876
+```
+
+2. **在本机一键部署插件并同步 Token 到远端**：
+
+```bash
+node ~/.gemini/config/plugins/answer-card/core/cli.mjs ssh-install your-remote-host
+```
+
+之后重连 SSH 即可生效：远端 Linux 上的 `PreToolUse` / `Stop` Hook 会自动检测 `~/.config/answer-card/bridge-token`，把审批、提问与完成卡通过隧道转发到你的 Mac 弹出（无隧道时毫秒级失败开放，回退原生界面）。
 
 ## 统一配置与 CLI
 

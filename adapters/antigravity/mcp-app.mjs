@@ -19,6 +19,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
+import { startBridgeServerAuto } from '../../core/bridge.mjs'
 import { activateHost, createCardQueue, ensureHelper, isMainModule, probeFrontmost, showCard, withCardLock } from '../../core/helper.mjs'
 import { buildReturnTestPayload, buildTestPayload } from '../../core/protocol.mjs'
 import {
@@ -397,7 +398,15 @@ export async function dispatchRpc(message, options = {}) {
 }
 
 if (isMainModule(import.meta.url)) {
+  const bridgePromise = startBridgeServerAuto()
+  const closeBridge = () => {
+    bridgePromise.then((srv) => srv?.close?.()).catch(() => undefined)
+  }
+  process.once('SIGINT', closeBridge)
+  process.once('SIGTERM', closeBridge)
+
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity })
+  rl.once('close', closeBridge)
   rl.on('line', (line) => {
     const trimmed = line.trim()
     if (!trimmed) return

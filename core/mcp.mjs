@@ -13,6 +13,7 @@
  */
 
 import { createInterface } from 'node:readline'
+import { startBridgeServerAuto } from './bridge.mjs'
 import { activateHost, createCardQueue, createTracer, ensureHelper, isHostFocused, isMainModule, showCard, withCardLock } from './helper.mjs'
 import { baseName, buildApprovalPayload, buildCompletePayload, buildQuestionPayload, buildReturnTestPayload, buildTestPayload, mapQuestionAnswers } from './protocol.mjs'
 import { defaultRecentPath, defaultSettingsPath, getHostProfile, muteReasonOf, readSettingsLayers, recordRecentEntry, resolveSettings, writeSettings } from './settings.mjs'
@@ -371,7 +372,15 @@ export async function dispatchRpc(message) {
 }
 
 if (isMainModule(import.meta.url)) {
+  const bridgePromise = startBridgeServerAuto()
+  const closeBridge = () => {
+    bridgePromise.then((srv) => srv?.close?.()).catch(() => undefined)
+  }
+  process.once('SIGINT', closeBridge)
+  process.once('SIGTERM', closeBridge)
+
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity })
+  rl.once('close', closeBridge)
   rl.on('line', (line) => {
     const trimmed = line.trim()
     if (!trimmed) return

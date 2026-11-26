@@ -12,6 +12,15 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rena
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import {
+  bridgeActivateHost,
+  bridgeProbeFrontmost,
+  bridgeShowCard,
+  encodeBridgeHelperPath,
+  parseBridgeHelperPath,
+  readBridgeToken,
+  resolveBridgeTarget,
+} from './bridge.mjs'
 
 /**
  * 兼容软链与空格路径的 ESM 主入口判断（Node 会对 import.meta.url 解软链，
@@ -89,11 +98,20 @@ export function parseHelperOutput(text) {
  * @returns {{ ok: boolean, helperPath: string, error?: string }}
  */
 export function ensureHelper(options = {}) {
+  const trace = options.trace ?? (() => {})
+  const warn = options.warn ?? trace
+
+  // 远端 SSH Linux 或显式指定桥接地址时，自动切换为本机 Mac 桥接模式。
+  const bridgeTarget = resolveBridgeTarget(options)
+  if (bridgeTarget) {
+    const bridgePath = encodeBridgeHelperPath(bridgeTarget.url)
+    trace(`helper bridge -> ${bridgeTarget.url}`)
+    return { ok: true, mode: 'bridge', helperPath: bridgePath }
+  }
+
   const helperPath = typeof options.helperPath === 'string' && options.helperPath.length > 0
     ? options.helperPath
     : defaultHelperPath()
-  const trace = options.trace ?? (() => {})
-  const warn = options.warn ?? trace
 
   if (existsSync(helperPath)) return { ok: true, helperPath }
   if (!existsSync(SWIFT_SOURCE)) {
@@ -152,6 +170,10 @@ export function ensureHelper(options = {}) {
  * @returns {Promise<{ bundleId: string, name: string } | undefined>}
  */
 export function probeFrontmost(helperPath) {
+  const bridgeUrl = parseBridgeHelperPath(helperPath)
+  if (bridgeUrl) {
+    return bridgeProbeFrontmost(bridgeUrl, readBridgeToken())
+  }
   return new Promise((resolve) => {
     let settled = false
     const finish = (value) => {
@@ -212,6 +234,11 @@ export async function isHostFocused(options) {
  */
 export function activateHost(options) {
   const trace = options.trace ?? (() => {})
+  const bridgeUrl = parseBridgeHelperPath(options.helperPath)
+  if (bridgeUrl) {
+    bridgeActivateHost(bridgeUrl, readBridgeToken(), options)
+    return
+  }
   const command = String(options.returnCommand ?? '').trim()
   if (command.length > 0) {
     trace('activate: custom command')
@@ -274,6 +301,10 @@ export function activateHost(options) {
  */
 export function showCard(helperPath, payload, options = {}) {
   const trace = options.trace ?? (() => {})
+  const bridgeUrl = parseBridgeHelperPath(helperPath)
+  if (bridgeUrl) {
+    return bridgeShowCard(bridgeUrl, readBridgeToken(), payload, options)
+  }
   return new Promise((resolve) => {
     let child
     let settled = false

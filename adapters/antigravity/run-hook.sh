@@ -18,4 +18,7 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec node "$SCRIPT_DIR/hook.mjs"
+if ! node "$SCRIPT_DIR/hook.mjs"; then
+  printf '{"decision":"ask"}\n'
+  exit 0
+fi
