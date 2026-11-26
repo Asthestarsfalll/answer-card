@@ -122,7 +122,7 @@ export const HOST_PROFILES = {
     themes: {
       light: {
         accent: '#084CCF',
-        completeAccent: '#2E8B57',
+        completeAccent: '#084CCF',
         background: '#FAFAFA',
         surface: '#EFEFF1',
         border: '#D9DADF',
@@ -131,7 +131,7 @@ export const HOST_PROFILES = {
       },
       dark: {
         accent: '#589DF6',
-        completeAccent: '#89CA78',
+        completeAccent: '#589DF6',
         background: '#21252B',
         surface: '#282C33',
         border: '#3B4048',

@@ -453,7 +453,8 @@ function findZedThemeColors(themesDir, targetName) {
         const textPrimary = pick(bg, s.text)
         const textSecondary = pick(bg, s['text.muted'])
         const accent = pick(bg, s['text.accent'], s['border.focused'])
-        const completeAccent = pick(bg, s.created, s.success)
+        // 完成色优先跟随主题强调色，主题缺失时才退回 created/success，避免与全局主色脱节。
+        const completeAccent = pick(bg, s['text.accent'], s.created, s.success)
         return {
           ...(mode ? { mode } : {}),
           ...(background ? { background } : {}),

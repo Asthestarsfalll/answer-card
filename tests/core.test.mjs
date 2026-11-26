@@ -622,6 +622,7 @@ test('theme: dynamic adaptive resolution (live snapshot, Zed JSONC + custom them
     assert.equal(zedResolved.mode, 'light')
     assert.equal(zedResolved.background, '#FAF8F5')
     assert.equal(zedResolved.accent, '#0A66C2')
+    assert.equal(zedResolved.completeAccent, '#0A66C2')
 
     // 3b. Zed installed extension blur theme (transparent panel.background skipped, flat surface derived)
     const zedExtRoot = join(dir, 'zed-extensions')
