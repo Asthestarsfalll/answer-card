@@ -110,7 +110,9 @@ agy plugin install ./answer-card
 | 工具审批（`run_command` / `call_mcp_tool` / `write_file` / `edit_file`） | `PreToolUse` | 按 `approvalPolicy` 后台弹审批卡，支持一次/会话/总是允许与拒绝原因输入 |
 | 回合完成 | `Stop` | 后台弹完成卡；留空确认切回对应窗口，输入文字直接返回 `decision: "continue"` 续跑 |
 
-> **审批拦截策略（`approvalPolicy`）**：`external`（默认，拦截越沙箱/高风险命令、工作区外文件写操作与 MCP）、`commands`（全部命令与 MCP）、`mutating`（命令、文件写/改与 MCP）、`all`（全部匹配工具）。工作区外文件写操作或未命中原生前缀白名单的越沙箱复合命令可能会先触发 Antigravity 内置权限门。
+> **审批拦截策略（`approvalPolicy`）**：`external`（默认，拦截越沙箱/高风险命令、工作区外文件写操作与 MCP）、`commands`（全部命令与 MCP）、`mutating`（命令、文件写/改与 MCP）、`all`（全部匹配工具）。
+>
+> **关于 Antigravity 原生权限门与 Turbo 模式**：Antigravity 的原生权限门位于 `PreToolUse` Hook 之前。将 **Settings → General → Global Permissions** 切为 **Turbo** 后，越沙箱命令行（`BypassSandbox: true`）会放行进入 `PreToolUse` 由 Answer Card 接管；但对工作区外敏感路径（如 `~/.ssh/config`、`~/.gemini/config/config.json`）Antigravity 仍保留独立的文件边界保护（需单独放开 **Non-Workspace File Access**，且部分硬编码敏感目录始终走原生确认）。若日后停用 `answer-card` 插件，请及时改回默认预设。
 
 ---
 

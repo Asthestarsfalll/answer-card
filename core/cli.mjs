@@ -219,6 +219,7 @@ async function main() {
     ].join('\n')
     const res = spawnSync('ssh', [sshHost, remoteCmd], {
       input: `${token}\n`,
+      stdio: ['pipe', 'pipe', 'inherit'],
       encoding: 'utf8',
     })
     if (res.status !== 0) {
