@@ -28,6 +28,7 @@
   },
   "files": [
     "plugin.json",
+    "agy-market.json",
     "hooks.json",
     "mcp_config.json",
     "rules",
@@ -37,6 +38,7 @@
     "adapters",
     "cordis.patch.yml",
     "README.md",
+    "README.en.md",
     "LICENSE"
   ],
   "keywords": [

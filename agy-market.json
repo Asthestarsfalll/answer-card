@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "pluginRoot": ".",
+  "categories": ["productivity"],
+  "tags": [
+    "floating-window",
+    "approval",
+    "ask-question",
+    "completion-notify",
+    "mcp-app",
+    "settings-ui",
+    "macos",
+    "antigravity",
+    "dsh",
+    "zed"
+  ],
+  "platforms": ["darwin"]
+}
