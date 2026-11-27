@@ -1440,9 +1440,26 @@ func warpPointer(to point: CGPoint) {
     CGAssociateMouseAndMouseCursorPosition(1)
 }
 
+/// 诊断信息（仅 --activate 输出用）。
+var activateDebug: [String] = []
+
+/// 取该进程当前**最前**（z 序第一）的普通窗口边界；CGWindowList 返回的顺序即前→后。
+func frontWindowBounds(pid: pid_t) -> CGRect? {
+    guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return nil }
+    for info in list {
+        guard let owner = info[kCGWindowOwnerPID as String] as? pid_t, owner == pid,
+              let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
+              let dict = info[kCGWindowBounds as String] as? [String: Any],
+              let rect = CGRect(dictionaryRepresentation: dict as CFDictionary) else { continue }
+        if rect.width < 200 || rect.height < 200 { continue }
+        return rect
+    }
+    return nil
+}
+
 /// 通过 macOS Accessibility API 按标题关键词（如会话标题、工作区目录名）精准拉起指定窗口，
 /// 顺带取消最小化并返回该窗口在屏幕上的精确边界（供 --warp 挪指针使用）。
-func raiseMatchingWindow(pid: pid_t, hints: [String]) -> CGRect? {
+func raiseMatchingWindow(pid: pid_t, hints: [String], preferNonFront: Bool = true) -> (CGRect, String)? {
     guard !hints.isEmpty, AXIsProcessTrusted() else { return nil }
     let appEl = AXUIElementCreateApplication(pid)
     var value: AnyObject?
@@ -1450,20 +1467,65 @@ func raiseMatchingWindow(pid: pid_t, hints: [String]) -> CGRect? {
           let windows = value as? [AXUIElement], !windows.isEmpty else { return nil }
 
     let normalizedHints = hints.map { $0.lowercased() }.filter { !$0.isEmpty }
-    var matched: AXUIElement?
+
+    // 卡片只在"会话窗口不在前台"时才出现，因此同标题多窗口时
+    // 应优先拉起"不是当前最前"的那个窗口（用 CGWindowList 的 z 序判断）。
+    let frontBounds = frontWindowBounds(pid: pid)
+    func windowFrame(_ win: AXUIElement) -> CGRect? {
+        var posObj: AnyObject?
+        var sizeObj: AnyObject?
+        guard AXUIElementCopyAttributeValue(win, kAXPositionAttribute as CFString, &posObj) == .success,
+              AXUIElementCopyAttributeValue(win, kAXSizeAttribute as CFString, &sizeObj) == .success,
+              let posVal = posObj, let sizeVal = sizeObj else { return nil }
+        var pos = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(posVal as! AXValue, .cgPoint, &pos),
+              AXValueGetValue(sizeVal as! AXValue, .cgSize, &size) else { return nil }
+        return CGRect(origin: pos, size: size)
+    }
+    func sameFrame(_ a: CGRect, _ b: CGRect) -> Bool {
+        abs(a.origin.x - b.origin.x) < 2 && abs(a.origin.y - b.origin.y) < 2
+            && abs(a.width - b.width) < 2 && abs(a.height - b.height) < 2
+    }
+
+    var candidates: [AXUIElement] = []
     // 按提示优先级匹配（更具体的会话标题/目录名优先）。
-    outer: for hint in normalizedHints {
+    for hint in normalizedHints {
         for win in windows {
+            if candidates.contains(where: { CFEqual($0, win) }) { continue }
             var titleObj: AnyObject?
             if AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleObj) == .success,
                let title = titleObj as? String,
                title.lowercased().contains(hint) {
-                matched = win
-                break outer
+                candidates.append(win)
             }
         }
     }
-    guard let target = matched else { return nil }
+    guard !candidates.isEmpty else { return nil }
+    if let frame = windowFrame(candidates[0]) {
+        activateDebug.append("cand0=\(Int(frame.origin.x)),\(Int(frame.origin.y))")
+    }
+    if let front = frontBounds {
+        activateDebug.append("front=\(Int(front.origin.x)),\(Int(front.origin.y))")
+    } else {
+        activateDebug.append("front=nil")
+    }
+    activateDebug.append("cands=\(candidates.count) prefer=\(preferNonFront)")
+    // 优先选择"不是当前最前"的候选窗口。
+    var target = candidates[0]
+    // 只有"用户本来就停在 Zed 的另一个窗口"时才切换到非最前窗口；
+    // 若整个 Zed 在后台（前台是别的 App），应拉起 Zed 自己的最前窗口。
+    if preferNonFront, let front = frontBounds {
+        if let frame = windowFrame(candidates[0]), sameFrame(frame, front), candidates.count > 1 {
+            target = candidates[1]
+        }
+    }
+    var targetTitle = ""
+    var titleObj: AnyObject?
+    if AXUIElementCopyAttributeValue(target, kAXTitleAttribute as CFString, &titleObj) == .success,
+       let title = titleObj as? String {
+        targetTitle = title
+    }
 
     var minObj: AnyObject?
     if AXUIElementCopyAttributeValue(target, kAXMinimizedAttribute as CFString, &minObj) == .success,
@@ -1483,7 +1545,7 @@ func raiseMatchingWindow(pid: pid_t, hints: [String]) -> CGRect? {
         if AXValueGetValue(posVal as! AXValue, .cgPoint, &pos),
            AXValueGetValue(sizeVal as! AXValue, .cgSize, &size),
            size.width >= 200, size.height >= 200 {
-            return CGRect(origin: pos, size: size)
+            return (CGRect(origin: pos, size: size), targetTitle)
         }
     }
     return nil
@@ -1517,23 +1579,36 @@ if CommandLine.arguments.contains("--activate") {
         if let first = matchedApps.first?.bundleIdentifier { matchedBundle = first }
     }
 
+    // 记录激活前的状态：宿主自己是否就是前台 App（用于判断是否要切换窗口）。
+    let frontApp = NSWorkspace.shared.frontmostApplication
+    let hostWasActive = bundles.contains { $0.caseInsensitiveCompare(frontApp?.bundleIdentifier ?? "") == .orderedSame }
+
     var activated = false
     var targetBounds: CGRect?
+    var raisedTitle = ""
     for app in matchedApps {
         if #available(macOS 14.0, *) {
             if app.activate() { activated = true }
         } else if app.activate(options: [.activateAllWindows, .activateIgnoringOtherApps]) {
             activated = true
         }
-        if !hints.isEmpty, let raised = raiseMatchingWindow(pid: app.processIdentifier, hints: hints) {
-            targetBounds = raised
+    }
+
+    if let app = matchedApps.first, !hints.isEmpty {
+        // 等激活完成再置顶一次，避免被 Zed 自己的"恢复上次窗口"覆盖；
+        // 只调用一次，否则第二次会重新选窗导致来回切换。
+        Thread.sleep(forTimeInterval: 0.45)
+        if let raised = raiseMatchingWindow(pid: app.processIdentifier, hints: hints, preferNonFront: hostWasActive) {
+            targetBounds = raised.0
+            raisedTitle = raised.1
         }
     }
     var warped: CGPoint?
     if activated, shouldWarp, let app = matchedApps.first {
         Thread.sleep(forTimeInterval: 0.45)
-        if targetBounds == nil, !hints.isEmpty {
-            targetBounds = raiseMatchingWindow(pid: app.processIdentifier, hints: hints)
+        if targetBounds == nil, !hints.isEmpty, let raised = raiseMatchingWindow(pid: app.processIdentifier, hints: hints) {
+            targetBounds = raised.0
+            raisedTitle = raised.1
         }
         if let bounds = targetBounds ?? windowBounds(of: app.processIdentifier) {
             let point = CGPoint(x: bounds.midX, y: bounds.maxY - 90)
@@ -1546,6 +1621,8 @@ if CommandLine.arguments.contains("--activate") {
         "apps": matchedApps.count,
         "bundleId": matchedBundle,
         "matchedWindow": targetBounds != nil,
+        "windowTitle": raisedTitle,
+        "debug": activateDebug.joined(separator: " | "),
         "warped": warped.map { NSStringFromPoint($0) } ?? "none",
     ])
 }
