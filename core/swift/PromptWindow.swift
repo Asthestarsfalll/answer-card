@@ -147,9 +147,149 @@ func measureAttributed(_ attr: NSAttributedString, width: CGFloat) -> CGFloat {
     return ceil(rect.height) + 2
 }
 
+private final class MarkdownImageStore {
+    static var cache: [String: NSImage] = [:]
+    static var failed: Set<String> = []
+    static var inFlight: Set<String> = []
+
+    static func image(for rawUrl: String, onLoaded: (() -> Void)?) -> NSImage? {
+        if let cached = cache[rawUrl] { return cached }
+        if failed.contains(rawUrl) { return nil }
+
+        if rawUrl.hasPrefix("/") {
+            if let img = NSImage(contentsOfFile: rawUrl), img.size.width > 0, img.size.height > 0 {
+                cache[rawUrl] = img
+                return img
+            }
+            failed.insert(rawUrl)
+            return nil
+        }
+
+        guard let url = URL(string: rawUrl) else {
+            failed.insert(rawUrl)
+            return nil
+        }
+        if url.scheme == "file" {
+            if let img = NSImage(contentsOf: url), img.size.width > 0, img.size.height > 0 {
+                cache[rawUrl] = img
+                return img
+            }
+            failed.insert(rawUrl)
+            return nil
+        }
+
+        guard url.scheme == "http" || url.scheme == "https" else {
+            failed.insert(rawUrl)
+            return nil
+        }
+        guard !inFlight.contains(rawUrl) else { return nil }
+        inFlight.insert(rawUrl)
+
+        var req = URLRequest(url: url, timeoutInterval: 4)
+        req.cachePolicy = .returnCacheDataElseLoad
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            DispatchQueue.main.async {
+                inFlight.remove(rawUrl)
+                if let data, data.count <= 8 * 1024 * 1024,
+                   let img = NSImage(data: data), img.size.width > 0, img.size.height > 0 {
+                    cache[rawUrl] = img
+                    onLoaded?()
+                } else {
+                    failed.insert(rawUrl)
+                }
+            }
+        }.resume()
+        return nil
+    }
+}
+
+private func parseCssColor(_ raw: String) -> (color: NSColor, alpha: CGFloat)? {
+    let text = raw.trimmingCharacters(in: .whitespaces)
+    if text.hasPrefix("#") {
+        let hex = String(text.dropFirst())
+        let isHex = hex.unicodeScalars.allSatisfy {
+            (48...57).contains($0.value) || (65...70).contains($0.value) || (97...102).contains($0.value)
+        }
+        guard isHex else { return nil }
+        var expanded = hex
+        if hex.count == 3 || hex.count == 4 {
+            expanded = hex.map { "\($0)\($0)" }.joined()
+        }
+        guard expanded.count == 6 || expanded.count == 8 else { return nil }
+        var val: UInt64 = 0
+        guard Scanner(string: expanded).scanHexInt64(&val) else { return nil }
+        if expanded.count == 6 {
+            let r = CGFloat((val >> 16) & 0xFF) / 255
+            let g = CGFloat((val >> 8) & 0xFF) / 255
+            let b = CGFloat(val & 0xFF) / 255
+            return (NSColor(srgbRed: r, green: g, blue: b, alpha: 1), 1)
+        } else {
+            let r = CGFloat((val >> 24) & 0xFF) / 255
+            let g = CGFloat((val >> 16) & 0xFF) / 255
+            let b = CGFloat((val >> 8) & 0xFF) / 255
+            let a = CGFloat(val & 0xFF) / 255
+            return (NSColor(srgbRed: r, green: g, blue: b, alpha: a), a)
+        }
+    }
+
+    let lower = text.lowercased()
+    if (lower.hasPrefix("rgb(") || lower.hasPrefix("rgba(")) && lower.hasSuffix(")") {
+        let openIdx = lower.firstIndex(of: "(")!
+        let inner = lower[lower.index(after: openIdx)..<lower.index(before: lower.endIndex)]
+        let parts = inner.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard parts.count == 3 || parts.count == 4,
+              let r = Double(parts[0]), let g = Double(parts[1]), let b = Double(parts[2]) else {
+            return nil
+        }
+        var a = 1.0
+        if parts.count == 4 {
+            if parts[3].hasSuffix("%"), let pct = Double(parts[3].dropLast()) {
+                a = pct / 100.0
+            } else if let num = Double(parts[3]) {
+                a = num
+            } else {
+                return nil
+            }
+        }
+        let cr = CGFloat(min(255, max(0, r))) / 255
+        let cg = CGFloat(min(255, max(0, g))) / 255
+        let cb = CGFloat(min(255, max(0, b))) / 255
+        let ca = CGFloat(min(1, max(0, a)))
+        return (NSColor(srgbRed: cr, green: cg, blue: cb, alpha: ca), ca)
+    }
+
+    return nil
+}
+
+private func colorBadgeAttrs(
+    _ parsed: (color: NSColor, alpha: CGFloat),
+    codeFont: NSFont,
+    fallbackTextColor: NSColor,
+    para: NSParagraphStyle
+) -> [NSAttributedString.Key: Any] {
+    let fg: NSColor = parsed.alpha < 0.45
+        ? fallbackTextColor
+        : (isLightColor(parsed.color) ? NSColor(srgbRed: 0.10, green: 0.10, blue: 0.12, alpha: 1) : .white)
+    return [
+        .font: codeFont,
+        .foregroundColor: fg,
+        .backgroundColor: parsed.color,
+        .paragraphStyle: para,
+    ]
+}
+
 private let markdownInlineRegex = try? NSRegularExpression(
-    pattern: #"(``[^`\n]*(?:`[^`\n]+`[^`\n]*)*``|`[^`\n]+`|\*\*[^*\n]+?\*\*|__[^_\n]+?__|\[[^\]\n]+\]\([^)\n]+\)|(?<!\*)\*[^*\n]+?\*(?!\*))"#
+    pattern: #"(``[^`\n]*(?:`[^`\n]+`[^`\n]*)*``|`[^`\n]+`|\*\*[^*\n]+?\*\*|__[^_\n]+?__|~~[^~\n]+?~~|!\[[^\]\n]*\]\([^)\n]+\)|\[\^[^\]\s]+\]|\[[^\]\n]+\]\([^)\n]+\)|(?<!\*)\*[^*\n]+?\*(?!\*)|(?<![A-Za-z0-9_#])#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{3,4})\b|\brgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}(?:\s*,\s*(?:\d+(?:\.\d+)?%?|\.\d+))?\s*\))"#
 )
+
+private func makeItalicFont(from base: NSFont, size: CGFloat) -> NSFont {
+    let desc = base.fontDescriptor.withSymbolicTraits(.italic)
+    if let italic = NSFont(descriptor: desc, size: size),
+       italic.fontDescriptor.symbolicTraits.contains(.italic) {
+        return italic
+    }
+    return NSFontManager.shared.convert(base, toHaveTrait: .italicFontMask)
+}
 
 private func appendInlineMarkdown(
     _ line: String,
@@ -163,7 +303,10 @@ private func appendInlineMarkdown(
     textColor: NSColor,
     secondaryColor: NSColor,
     codeBg: NSColor,
-    accentColor: NSColor
+    accentColor: NSColor,
+    contentWidth: CGFloat = 320,
+    footnoteIndex: [String: Int] = [:],
+    onImageLoaded: (() -> Void)? = nil
 ) {
     let baseAttrs: [NSAttributedString.Key: Any] = [
         .font: baseFont,
@@ -188,25 +331,77 @@ private func appendInlineMarkdown(
             if inner.hasPrefix(" "), inner.hasSuffix(" "), inner.count >= 2 {
                 inner = String(inner.dropFirst().dropLast())
             }
-            target.append(NSAttributedString(string: " \(inner) ", attributes: [
+            let attrs = parseCssColor(inner).map {
+                colorBadgeAttrs($0, codeFont: codeFont, fallbackTextColor: textColor, para: para)
+            } ?? [
                 .font: codeFont,
                 .foregroundColor: textColor,
                 .backgroundColor: codeBg,
                 .paragraphStyle: para,
-            ]))
+            ]
+            target.append(NSAttributedString(string: " \(inner) ", attributes: attrs))
         } else if token.hasPrefix("`"), token.hasSuffix("`"), token.count >= 2 {
             let inner = String(token.dropFirst().dropLast())
-            target.append(NSAttributedString(string: " \(inner) ", attributes: [
+            let attrs = parseCssColor(inner).map {
+                colorBadgeAttrs($0, codeFont: codeFont, fallbackTextColor: textColor, para: para)
+            } ?? [
                 .font: codeFont,
                 .foregroundColor: textColor,
                 .backgroundColor: codeBg,
                 .paragraphStyle: para,
-            ]))
+            ]
+            target.append(NSAttributedString(string: " \(inner) ", attributes: attrs))
         } else if (token.hasPrefix("**") && token.hasSuffix("**")) || (token.hasPrefix("__") && token.hasSuffix("__")), token.count >= 4 {
             let inner = String(token.dropFirst(2).dropLast(2))
             target.append(NSAttributedString(string: inner, attributes: [
                 .font: boldFont,
                 .foregroundColor: textColor,
+                .paragraphStyle: para,
+            ]))
+        } else if token.hasPrefix("~~"), token.hasSuffix("~~"), token.count >= 4 {
+            let inner = String(token.dropFirst(2).dropLast(2))
+            target.append(NSAttributedString(string: inner, attributes: [
+                .font: baseFont,
+                .foregroundColor: secondaryColor,
+                .strikethroughStyle: NSUnderlineStyle.single.rawValue,
+                .paragraphStyle: para,
+            ]))
+        } else if token.hasPrefix("!["), let sep = token.range(of: "]("), token.hasSuffix(")") {
+            let altStart = token.index(token.startIndex, offsetBy: 2)
+            let altText = String(token[altStart..<sep.lowerBound])
+            let urlStart = sep.upperBound
+            let urlEnd = token.index(before: token.endIndex)
+            let urlStr = String(token[urlStart..<urlEnd])
+            if let img = MarkdownImageStore.image(for: urlStr, onLoaded: onImageLoaded) {
+                let maxW = max(80, contentWidth - 8)
+                let maxH: CGFloat = 220
+                let ratio = min(1, min(maxW / img.size.width, maxH / img.size.height))
+                let drawSize = NSSize(width: floor(img.size.width * ratio), height: floor(img.size.height * ratio))
+                let attachment = NSTextAttachment()
+                attachment.image = img
+                attachment.bounds = CGRect(origin: .zero, size: drawSize)
+                let imgAttr = NSMutableAttributedString(attachment: attachment)
+                imgAttr.addAttributes([.paragraphStyle: para], range: NSRange(location: 0, length: imgAttr.length))
+                target.append(imgAttr)
+            } else {
+                let label = altText.isEmpty ? "[图片]" : "[图片: \(altText)]"
+                var attrs: [NSAttributedString.Key: Any] = [
+                    .font: baseFont,
+                    .foregroundColor: accentColor,
+                    .paragraphStyle: para,
+                ]
+                if let url = URL(string: urlStr), url.scheme == "http" || url.scheme == "https" || url.scheme == "file" {
+                    attrs[.link] = url
+                }
+                target.append(NSAttributedString(string: label, attributes: attrs))
+            }
+        } else if token.hasPrefix("[^"), token.hasSuffix("]"), token.count >= 4 {
+            let id = String(token.dropFirst(2).dropLast())
+            let display = footnoteIndex[id].map { "[\($0)]" } ?? "[\(id)]"
+            target.append(NSAttributedString(string: display, attributes: [
+                .font: NSFont.systemFont(ofSize: max(9, lineSize - 2.5), weight: .medium),
+                .foregroundColor: accentColor,
+                .baselineOffset: 3.5,
                 .paragraphStyle: para,
             ]))
         } else if token.hasPrefix("["), let sep = token.range(of: "]("), token.hasSuffix(")") {
@@ -216,7 +411,7 @@ private func appendInlineMarkdown(
             let urlStr = String(token[urlStart..<urlEnd])
             var attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: lineSize, weight: .medium),
-                .foregroundColor: accentColor,
+                .foregroundColor: accentColor.withAlphaComponent(0.45),
                 .underlineStyle: NSUnderlineStyle.single.rawValue,
                 .paragraphStyle: para,
             ]
@@ -229,8 +424,14 @@ private func appendInlineMarkdown(
             target.append(NSAttributedString(string: inner, attributes: [
                 .font: italicFont,
                 .foregroundColor: secondaryColor,
+                .obliqueness: 0.16,
                 .paragraphStyle: para,
             ]))
+        } else if let parsed = parseCssColor(token) {
+            target.append(NSAttributedString(
+                string: " \(token) ",
+                attributes: colorBadgeAttrs(parsed, codeFont: codeFont, fallbackTextColor: textColor, para: para)
+            ))
         } else {
             target.append(NSAttributedString(string: token, attributes: baseAttrs))
         }
@@ -272,7 +473,7 @@ private func isHorizontalRuleLine(_ line: String) -> Bool {
     return trimmed.range(of: #"^([-*_])(?:\s*\1){2,}$"#, options: .regularExpression) != nil
 }
 
-/// 轻量 Markdown 渲染：支持标题、无序列表、分割线、表格、**加粗**、*斜体*、`行内代码` 与 [链接](url)。
+/// 轻量 Markdown 渲染：支持标题、无序/有序/任务列表、引用块、代码块、分割线、表格、图片、脚注、**加粗**、*斜体*、~~删除线~~、`行内代码` 与 [链接](url)。
 func renderMarkdown(
     _ raw: String,
     fontSize: CGFloat,
@@ -282,16 +483,149 @@ func renderMarkdown(
     codeBg: NSColor,
     accentColor: NSColor,
     lineSpacing: CGFloat = 4,
-    contentWidth: CGFloat = 320
+    contentWidth: CGFloat = 320,
+    onImageLoaded: (() -> Void)? = nil
 ) -> NSAttributedString {
     let result = NSMutableAttributedString()
-    let lines = raw.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
+    let rawLines = raw.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
+
+    // 预扫描脚注定义：`[^id]: 文本`
+    var footnoteDefs: [(id: String, text: String)] = []
+    var footnoteIndex: [String: Int] = [:]
+    var lines: [String] = []
+    for rawLine in rawLines {
+        if let defRange = rawLine.range(of: #"^\s*\[\^([^\]\s]+)\]:\s*(.+)$"#, options: .regularExpression) {
+            let matched = String(rawLine[defRange]).trimmingCharacters(in: .whitespaces)
+            if let colon = matched.range(of: "]:") {
+                let idStart = matched.index(matched.startIndex, offsetBy: 2)
+                let id = String(matched[idStart..<colon.lowerBound])
+                let text = String(matched[colon.upperBound...]).trimmingCharacters(in: .whitespaces)
+                if footnoteIndex[id] == nil {
+                    footnoteIndex[id] = footnoteDefs.count + 1
+                    footnoteDefs.append((id: id, text: text))
+                }
+                continue
+            }
+        }
+        lines.append(rawLine)
+    }
     var lineIdx = 0
 
     while lineIdx < lines.count {
         let originalLine = lines[lineIdx]
+        let trimmedLine = originalLine.trimmingCharacters(in: .whitespaces)
 
-        // 1. 表格块：当前行含 `|`，下一行为 `| --- | --- |` 分隔行
+        // 1. 多行代码块：``` 或 ~~~
+        if trimmedLine.hasPrefix("```") || trimmedLine.hasPrefix("~~~") {
+            let fence = trimmedLine.hasPrefix("```") ? "```" : "~~~"
+            var codeLines: [String] = []
+            var cursor = lineIdx + 1
+            while cursor < lines.count {
+                if lines[cursor].trimmingCharacters(in: .whitespaces).hasPrefix(fence) {
+                    cursor += 1
+                    break
+                }
+                codeLines.append(lines[cursor])
+                cursor += 1
+            }
+
+            let table = NSTextTable()
+            table.numberOfColumns = 1
+            table.collapsesBorders = true
+            let block = NSTextTableBlock(table: table, startingRow: 0, rowSpan: 1, startingColumn: 0, columnSpan: 1)
+            block.setContentWidth(100, type: .percentageValueType)
+            block.backgroundColor = codeBg
+            block.setBorderColor(secondaryColor.withAlphaComponent(0.22))
+            block.setWidth(0.5, type: .absoluteValueType, for: .border)
+            block.setWidth(6, type: .absoluteValueType, for: .padding, edge: .minY)
+            block.setWidth(6, type: .absoluteValueType, for: .padding, edge: .maxY)
+            block.setWidth(9, type: .absoluteValueType, for: .padding, edge: .minX)
+            block.setWidth(9, type: .absoluteValueType, for: .padding, edge: .maxX)
+
+            let codePara = NSMutableParagraphStyle()
+            codePara.textBlocks = [block]
+            codePara.lineBreakMode = .byWordWrapping
+            codePara.lineSpacing = 2.5
+
+            let codeFont = NSFont.monospacedSystemFont(ofSize: max(10, fontSize - 1), weight: .regular)
+            let codeText = codeLines.isEmpty ? " " : codeLines.joined(separator: "\n")
+            result.append(NSAttributedString(string: codeText + "\n", attributes: [
+                .font: codeFont,
+                .foregroundColor: textColor,
+                .paragraphStyle: codePara,
+            ]))
+
+            lineIdx = cursor
+            continue
+        }
+
+        // 2. 引用块：连续 `>` 行
+        if originalLine.range(of: #"^\s*>\s?"#, options: .regularExpression) != nil {
+            var quoteLines: [String] = []
+            var cursor = lineIdx
+            while cursor < lines.count,
+                  let prefixRange = lines[cursor].range(of: #"^\s*>\s?"#, options: .regularExpression) {
+                var qLine = lines[cursor]
+                qLine.removeSubrange(prefixRange)
+                quoteLines.append(qLine)
+                cursor += 1
+            }
+
+            let table = NSTextTable()
+            table.numberOfColumns = 1
+            table.collapsesBorders = true
+            let block = NSTextTableBlock(table: table, startingRow: 0, rowSpan: 1, startingColumn: 0, columnSpan: 1)
+            block.setContentWidth(100, type: .percentageValueType)
+            block.backgroundColor = secondaryColor.withAlphaComponent(0.06)
+            block.setWidth(0, type: .absoluteValueType, for: .border)
+            block.setWidth(2.5, type: .absoluteValueType, for: .border, edge: .minX)
+            block.setBorderColor(accentColor.withAlphaComponent(0.65), for: .minX)
+            block.setWidth(4, type: .absoluteValueType, for: .padding, edge: .minY)
+            block.setWidth(4, type: .absoluteValueType, for: .padding, edge: .maxY)
+            block.setWidth(10, type: .absoluteValueType, for: .padding, edge: .minX)
+            block.setWidth(8, type: .absoluteValueType, for: .padding, edge: .maxX)
+
+            let qPara = NSMutableParagraphStyle()
+            qPara.textBlocks = [block]
+            qPara.lineBreakMode = .byWordWrapping
+            qPara.lineSpacing = lineSpacing
+
+            let qFont = NSFont.systemFont(ofSize: fontSize, weight: baseWeight)
+            let qBold = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
+            let qItalic = makeItalicFont(from: qFont, size: fontSize)
+            let qCode = NSFont.monospacedSystemFont(ofSize: max(10, fontSize - 1), weight: .regular)
+
+            let qAttr = NSMutableAttributedString()
+            for (idx, qLine) in quoteLines.enumerated() {
+                appendInlineMarkdown(
+                    qLine,
+                    to: qAttr,
+                    para: qPara,
+                    lineSize: fontSize,
+                    baseFont: qFont,
+                    boldFont: qBold,
+                    italicFont: qItalic,
+                    codeFont: qCode,
+                    textColor: secondaryColor,
+                    secondaryColor: secondaryColor,
+                    codeBg: codeBg,
+                    accentColor: accentColor,
+                    contentWidth: contentWidth - 20,
+                    footnoteIndex: footnoteIndex,
+                    onImageLoaded: onImageLoaded
+                )
+                if idx < quoteLines.count - 1 {
+                    qAttr.append(NSAttributedString(string: "\n", attributes: [.font: qFont, .paragraphStyle: qPara]))
+                }
+            }
+            qAttr.append(NSAttributedString(string: "\n", attributes: [.font: qFont, .paragraphStyle: qPara]))
+            result.append(qAttr)
+
+            lineIdx = cursor
+            continue
+        }
+
+        // 3. 表格块：当前行含 `|`，下一行为 `| --- | --- |` 分隔行
         if lineIdx + 1 < lines.count,
            originalLine.contains("|"),
            let alignments = parseTableAlignments(lines[lineIdx + 1]) {
@@ -317,7 +651,7 @@ func renderMarkdown(
             let bodyFont = NSFont.systemFont(ofSize: tableFontSize, weight: baseWeight)
             let headerFont = NSFont.systemFont(ofSize: tableFontSize, weight: .semibold)
             let boldFont = NSFont.systemFont(ofSize: tableFontSize, weight: .semibold)
-            let italicFont = NSFontManager.shared.convert(bodyFont, toHaveTrait: .italicFontMask)
+            let italicFont = makeItalicFont(from: bodyFont, size: tableFontSize)
             let codeFont = NSFont.monospacedSystemFont(ofSize: max(10, tableFontSize - 1), weight: .regular)
 
             for (rIdx, row) in rows.enumerated() {
@@ -363,7 +697,10 @@ func renderMarkdown(
                         textColor: textColor,
                         secondaryColor: secondaryColor,
                         codeBg: codeBg,
-                        accentColor: accentColor
+                        accentColor: accentColor,
+                        contentWidth: max(80, contentWidth / CGFloat(colCount)),
+                        footnoteIndex: footnoteIndex,
+                        onImageLoaded: onImageLoaded
                     )
                     cellAttr.append(NSAttributedString(string: "\n", attributes: [
                         .font: cellBaseFont,
@@ -377,7 +714,7 @@ func renderMarkdown(
             continue
         }
 
-        // 2. 分割线：--- / *** / ___ / --
+        // 4. 分割线：--- / *** / ___ / --
         if isHorizontalRuleLine(originalLine) {
             let hrPara = NSMutableParagraphStyle()
             hrPara.paragraphSpacingBefore = 4
@@ -401,17 +738,27 @@ func renderMarkdown(
             continue
         }
 
-        // 3. 普通行 / 标题 / 无序列表
+        // 5. 普通行 / 标题 / 任务列表 / 无序列表 / 有序列表
         var line = originalLine
         var isHeading = false
         var isBullet = false
+        var taskChecked: Bool?
+        var orderedPrefix: String?
 
         if let range = line.range(of: #"^\s*#{1,6}\s+"#, options: .regularExpression) {
             line.removeSubrange(range)
             isHeading = true
+        } else if let range = line.range(of: #"^\s*[-*•]\s+\[([ xX])\]\s+"#, options: .regularExpression) {
+            let matched = String(line[range])
+            taskChecked = matched.contains("[x]") || matched.contains("[X]")
+            line.removeSubrange(range)
         } else if let range = line.range(of: #"^\s*[-*•]\s+"#, options: .regularExpression) {
             line.removeSubrange(range)
             isBullet = true
+        } else if let range = line.range(of: #"^\s*\d+\.\s+"#, options: .regularExpression) {
+            let matched = String(line[range]).trimmingCharacters(in: .whitespaces)
+            line.removeSubrange(range)
+            orderedPrefix = "\(matched) "
         }
 
         let para = NSMutableParagraphStyle()
@@ -421,18 +768,33 @@ func renderMarkdown(
         if isBullet {
             para.firstLineHeadIndent = 0
             para.headIndent = 14
+        } else if taskChecked != nil || orderedPrefix != nil {
+            para.firstLineHeadIndent = 0
+            para.headIndent = 18
         }
 
         let lineSize = isHeading ? fontSize + 1.2 : fontSize
         let lineWeight: NSFont.Weight = isHeading ? .semibold : baseWeight
         let baseFont = NSFont.systemFont(ofSize: lineSize, weight: lineWeight)
         let boldFont = NSFont.systemFont(ofSize: lineSize, weight: .semibold)
-        let italicFont = NSFontManager.shared.convert(baseFont, toHaveTrait: .italicFontMask)
+        let italicFont = makeItalicFont(from: baseFont, size: lineSize)
         let codeFont = NSFont.monospacedSystemFont(ofSize: max(10, lineSize - 1), weight: .regular)
 
         let lineAttr = NSMutableAttributedString()
-        if isBullet {
+        if let checked = taskChecked {
+            lineAttr.append(NSAttributedString(string: checked ? "☑  " : "☐  ", attributes: [
+                .font: boldFont,
+                .foregroundColor: checked ? accentColor : secondaryColor,
+                .paragraphStyle: para,
+            ]))
+        } else if isBullet {
             lineAttr.append(NSAttributedString(string: "•  ", attributes: [
+                .font: boldFont,
+                .foregroundColor: accentColor,
+                .paragraphStyle: para,
+            ]))
+        } else if let prefix = orderedPrefix {
+            lineAttr.append(NSAttributedString(string: prefix, attributes: [
                 .font: boldFont,
                 .foregroundColor: accentColor,
                 .paragraphStyle: para,
@@ -451,10 +813,13 @@ func renderMarkdown(
             textColor: textColor,
             secondaryColor: secondaryColor,
             codeBg: codeBg,
-            accentColor: accentColor
+            accentColor: accentColor,
+            contentWidth: contentWidth,
+            footnoteIndex: footnoteIndex,
+            onImageLoaded: onImageLoaded
         )
 
-        if lineIdx < lines.count - 1 {
+        if lineIdx < lines.count - 1 || !footnoteDefs.isEmpty {
             lineAttr.append(NSAttributedString(string: "\n", attributes: [
                 .font: baseFont,
                 .foregroundColor: textColor,
@@ -463,6 +828,50 @@ func renderMarkdown(
         }
         result.append(lineAttr)
         lineIdx += 1
+    }
+
+    if !footnoteDefs.isEmpty {
+        let fnSize = max(10.5, fontSize - 1.5)
+        let fnFont = NSFont.systemFont(ofSize: fnSize, weight: .regular)
+        let fnBold = NSFont.systemFont(ofSize: fnSize, weight: .semibold)
+        let fnItalic = makeItalicFont(from: fnFont, size: fnSize)
+        let fnCode = NSFont.monospacedSystemFont(ofSize: max(9.5, fnSize - 0.5), weight: .regular)
+        let fnPara = NSMutableParagraphStyle()
+        fnPara.lineBreakMode = .byWordWrapping
+        fnPara.lineSpacing = 2
+        fnPara.paragraphSpacing = 2
+        fnPara.firstLineHeadIndent = 0
+        fnPara.headIndent = 18
+
+        for (idx, def) in footnoteDefs.enumerated() {
+            let fnAttr = NSMutableAttributedString()
+            fnAttr.append(NSAttributedString(string: "[\(idx + 1)] ", attributes: [
+                .font: fnBold,
+                .foregroundColor: accentColor,
+                .paragraphStyle: fnPara,
+            ]))
+            appendInlineMarkdown(
+                def.text,
+                to: fnAttr,
+                para: fnPara,
+                lineSize: fnSize,
+                baseFont: fnFont,
+                boldFont: fnBold,
+                italicFont: fnItalic,
+                codeFont: fnCode,
+                textColor: secondaryColor,
+                secondaryColor: secondaryColor,
+                codeBg: codeBg,
+                accentColor: accentColor,
+                contentWidth: contentWidth,
+                footnoteIndex: footnoteIndex,
+                onImageLoaded: onImageLoaded
+            )
+            if idx < footnoteDefs.count - 1 {
+                fnAttr.append(NSAttributedString(string: "\n", attributes: [.font: fnFont, .paragraphStyle: fnPara]))
+            }
+            result.append(fnAttr)
+        }
     }
 
     return result
@@ -1131,16 +1540,20 @@ final class CardController: NSObject, NSApplicationDelegate {
     }
 
     private func md(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular, textColor: NSColor, width: CGFloat = 320) -> NSAttributedString {
-        renderMarkdown(
+        let codeBg = color(payload.accent).withAlphaComponent(0.45)
+        return renderMarkdown(
             text,
             fontSize: size * scale,
             baseWeight: weight,
             textColor: textColor,
             secondaryColor: secondaryTextColor,
-            codeBg: surfaceColor,
+            codeBg: codeBg,
             accentColor: color(payload.accent),
             lineSpacing: 4 * scale,
-            contentWidth: width
+            contentWidth: width,
+            onImageLoaded: { [weak self] in
+                self?.build(rebuilding: true)
+            }
         )
     }
 

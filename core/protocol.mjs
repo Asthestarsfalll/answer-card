@@ -244,8 +244,6 @@ function followUpGroups(hostLabel) {
  */
 export function buildCompletePayload({ host, hostLabel, title, message, subtitle, settings, allowFollowUp = false }) {
   const groups = allowFollowUp ? followUpGroups(hostLabel) : []
-  const resolvedTheme = resolveHostTheme({ host, settings })
-  const completeAccent = resolvedTheme.completeAccent || '#2FBF71'
 
   return {
     kind: 'complete',
@@ -257,7 +255,7 @@ export function buildCompletePayload({ host, hostLabel, title, message, subtitle
     submit: `回到 ${hostLabel}`,
     ...(allowFollowUp ? { submitWhenTyped: `发送到 ${hostLabel}` } : {}),
     dismiss: '知道了',
-    ...appearanceOf(settings, completeAccent, host),
+    ...appearanceOf(settings, undefined, host),
   }
 }
 
