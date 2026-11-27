@@ -25,6 +25,20 @@ Approve tool calls, answer single/multi-select or free-text questions, and jump 
 └───────────────────────────────────────────────────┘
 ```
 
+## Screenshots
+
+| Single / Multi-Select & Input | Completion & Follow-up (Antigravity) |
+| :---: | :---: |
+| ![Single/multi-select and input](assets/screenshots/question-card.png) | ![Antigravity completion card](assets/screenshots/complete-antigravity.png) |
+
+| Multi-Host Return (Zed) | Live Theme Adaptation (Warm Light) |
+| :---: | :---: |
+| ![Zed light completion card](assets/screenshots/complete-zed.png) | ![Warm light theme](assets/screenshots/theme-warm-light.png) |
+
+| Full Markdown & Color Swatch Rendering |
+| :---: |
+| ![Markdown showcase](assets/screenshots/markdown-showcase.png) |
+
 ## Core Features
 
 - **Approval on the card**: when a tool asks for permission the card pops up in the background with *Allow once / Allow for session / Always allow / Deny*, plus a free-text denial reason or replacement instruction. Antigravity automatically receives `permissionOverrides` so the native dialog does not appear twice; picking *Later* hands control back to the host UI with no loss.

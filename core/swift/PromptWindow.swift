@@ -1420,6 +1420,32 @@ final class CardController: NSObject, NSApplicationDelegate {
             guard let self else { return event }
             return self.handleKeyDown(event)
         }
+        if let shotPath = flagValue("--screenshot") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                guard let self, let contentView = self.window?.contentView else { exit(1) }
+                contentView.layoutSubtreeIfNeeded()
+                let bounds = contentView.bounds
+                let scale: CGFloat = 2
+                guard let rep = NSBitmapImageRep(
+                    bitmapDataPlanes: nil,
+                    pixelsWide: Int(bounds.width * scale),
+                    pixelsHigh: Int(bounds.height * scale),
+                    bitsPerSample: 8,
+                    samplesPerPixel: 4,
+                    hasAlpha: true,
+                    isPlanar: false,
+                    colorSpaceName: .deviceRGB,
+                    bytesPerRow: 0,
+                    bitsPerPixel: 0
+                ) else { exit(1) }
+                rep.size = bounds.size
+                contentView.cacheDisplay(in: bounds, to: rep)
+                if let png = rep.representation(using: .png, properties: [:]) {
+                    try? png.write(to: URL(fileURLWithPath: shotPath))
+                }
+                emit(["result": "screenshot", "path": shotPath])
+            }
+        }
     }
 
     private func digitFromEvent(_ event: NSEvent) -> Int? {

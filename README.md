@@ -25,6 +25,20 @@ A host-agnostic macOS always-on-top floating card for AI coding agents (**Antigr
 └───────────────────────────────────────────────────┘
 ```
 
+## 效果预览
+
+| 单选 / 多选 / 输入框 | 完成卡 & 追问（Antigravity） |
+| :---: | :---: |
+| ![单选多选与输入框](assets/screenshots/question-card.png) | ![Antigravity 完成卡](assets/screenshots/complete-antigravity.png) |
+
+| 多宿主回到对应窗口（Zed） | 多配色自适应（Everforest 暖色） |
+| :---: | :---: |
+| ![Zed 浅色完成卡](assets/screenshots/complete-zed.png) | ![暖色浅主题](assets/screenshots/theme-warm-light.png) |
+
+| Markdown 全语法 & 颜色块渲染 |
+| :---: |
+| ![Markdown 全语法展示](assets/screenshots/markdown-showcase.png) |
+
 ## 核心功能
 
 - **审批代答**：工具请求权限时后台弹卡，支持「允许一次 / 本次会话允许 / 总是允许 / 拒绝」以及直接输入拒绝原因或替代指令；Antigravity 自动附带 `permissionOverrides` 避免原生二次弹窗，点「稍后处理」无损交回宿主原生界面。
