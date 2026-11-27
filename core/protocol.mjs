@@ -206,21 +206,44 @@ export function mapQuestionAnswers(groups, outcome) {
 }
 
 /**
+ * 卡片是否支持「卡内追问」：取决于宿主有没有把追问送回 agent 的通道。
+ * - Antigravity：Stop hook 返回 `decision: continue`，可由设置关闭
+ * - DSH：agent 句柄的 `followup()` 直接排队下一轮，始终可用
+ * - Zed 原生 agent：没有注入通道
+ * @param {string} [host]
+ * @param {Record<string, any>} [settings]
+ * @returns {boolean}
+ */
+export function supportsFollowUp(host, settings = {}) {
+  const id = String(host || '').toLowerCase()
+  if (id === 'dsh') return true
+  if (id === 'antigravity') return settings.allowQuickFollowUp !== false
+  return false
+}
+
+/**
+ * 完成卡的追问输入分组。
+ * @param {string} hostLabel
+ * @returns {Array<Record<string, any>>}
+ */
+function followUpGroups(hostLabel) {
+  return [{
+    id: 'followup',
+    text: '',
+    multi: false,
+    input: true,
+    optional: true,
+    placeholder: `直接输入追问继续，或留空点「回到 ${hostLabel}」…`,
+    choices: [],
+  }]
+}
+
+/**
  * 构造「任务完成」卡片载荷。
  * @param {{ host?: string, hostLabel: string, title: string, message?: string, subtitle?: string, settings: Record<string, any>, allowFollowUp?: boolean }} params
  */
 export function buildCompletePayload({ host, hostLabel, title, message, subtitle, settings, allowFollowUp = false }) {
-  const groups = allowFollowUp
-    ? [{
-        id: 'followup',
-        text: '',
-        multi: false,
-        input: true,
-        optional: true,
-        placeholder: `直接输入追问继续，或留空点「回到 ${hostLabel}」…`,
-        choices: [],
-      }]
-    : []
+  const groups = allowFollowUp ? followUpGroups(hostLabel) : []
   const resolvedTheme = resolveHostTheme({ host, settings })
   const completeAccent = resolvedTheme.completeAccent || '#2FBF71'
 
@@ -271,6 +294,8 @@ export function buildTestPayload({ host, hostLabel, settings }) {
  */
 export function buildReturnTestPayload({ host, hostLabel, settings }) {
   const command = String(settings.returnCommand ?? '').trim()
+  // 与真实完成卡保持一致：支持追问的宿主也带上输入框。
+  const allowFollowUp = supportsFollowUp(host, settings)
   return {
     kind: 'complete',
     kicker: `${hostLabel} · 回到 ${hostLabel} 测试`,
@@ -279,8 +304,9 @@ export function buildReturnTestPayload({ host, hostLabel, settings }) {
     message: command.length > 0
       ? `点下面按钮会执行：${command.slice(0, 120)}`
       : `点下面按钮会激活 ${hostLabel} 窗口，并把鼠标指针移到输入框附近。`,
-    groups: [],
+    groups: allowFollowUp ? followUpGroups(hostLabel) : [],
     submit: `回到 ${hostLabel}`,
+    ...(allowFollowUp ? { submitWhenTyped: `发送到 ${hostLabel}` } : {}),
     dismiss: '关闭',
     ...appearanceOf(settings, settings.accent, host),
   }

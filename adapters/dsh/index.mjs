@@ -34,6 +34,7 @@ import {
   buildTestPayload,
   mapQuestionAnswers,
   shorten,
+  supportsFollowUp,
 } from '../../core/protocol.mjs'
 import {
   DEFAULT_SETTINGS,
@@ -352,7 +353,7 @@ export function apply(ctx, rawConfig = {}) {
       hostLabel: HOST_PROFILES.dsh.shortName,
       title: completeTitle,
       settings: settings(),
-      allowFollowUp: true,
+      allowFollowUp: supportsFollowUp('dsh', settings()),
     })
     const sessionId = typeof agent?.session?.id === 'string' ? agent.session.id : ''
     ;(async () => {

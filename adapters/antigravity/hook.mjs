@@ -33,6 +33,7 @@ import {
   mapQuestionAnswers,
   shorten,
   shortenMultiline,
+  supportsFollowUp,
 } from '../../core/protocol.mjs'
 import {
   HOST_PROFILES,
@@ -594,7 +595,7 @@ export async function handleHookInput(input, deps = {}) {
       subtitle: isError ? '执行异常终止' : undefined,
       message,
       settings,
-      allowFollowUp: settings.allowQuickFollowUp !== false,
+      allowFollowUp: supportsFollowUp(HOST, settings),
     })
 
     trace(`ag-complete: showing reason=${input?.terminationReason ?? 'unknown'}`)

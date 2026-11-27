@@ -23,7 +23,7 @@ import { describeAgent, lastMessageKind, pickTurnCompletion, shouldSkipForFocus,
 import { createBridgeRequestHandler, encodeBridgeHelperPath, parseBridgeHelperPath, resolveBridgeTarget } from '../core/bridge.mjs'
 import { ensureHelper, parseHelperOutput } from '../core/helper.mjs'
 import { handleToolCall } from '../core/mcp.mjs'
-import { buildApprovalPayload, buildCompletePayload, buildQuestionPayload, mapQuestionAnswers } from '../core/protocol.mjs'
+import { buildApprovalPayload, buildCompletePayload, buildQuestionPayload, buildReturnTestPayload, mapQuestionAnswers, supportsFollowUp } from '../core/protocol.mjs'
 import { createSettingsRequestHandler } from '../core/settings-server.mjs'
 import {
   DEFAULT_SETTINGS,
@@ -1030,4 +1030,32 @@ test('dsh: completion card queues follow-up on the agent handle', () => {
   // 句柄不支持 followup 时返回 false，调用方回退为激活窗口。
   assert.equal(dshAdapter.sendFollowUp({}, 'x'), false)
   assert.equal(dshAdapter.sendFollowUp(null, 'x'), false)
+})
+
+test('protocol: follow-up support follows the host capability', () => {
+  assert.equal(supportsFollowUp('dsh'), true)
+  assert.equal(supportsFollowUp('antigravity', {}), true)
+  assert.equal(supportsFollowUp('antigravity', { allowQuickFollowUp: false }), false)
+  assert.equal(supportsFollowUp('zed'), false)
+  assert.equal(supportsFollowUp(undefined), false)
+
+  // 「回到 X」测试卡与真实完成卡保持一致。
+  const dshTest = buildReturnTestPayload({ host: 'dsh', hostLabel: 'DSH', settings: DEFAULT_SETTINGS })
+  assert.equal(dshTest.groups[0]?.id, 'followup')
+  assert.equal(dshTest.submitWhenTyped, '发送到 DSH')
+
+  const agTest = buildReturnTestPayload({ host: 'antigravity', hostLabel: 'Antigravity', settings: DEFAULT_SETTINGS })
+  assert.equal(agTest.groups[0]?.id, 'followup')
+
+  const agNoFollow = buildReturnTestPayload({
+    host: 'antigravity',
+    hostLabel: 'Antigravity',
+    settings: { ...DEFAULT_SETTINGS, allowQuickFollowUp: false },
+  })
+  assert.deepEqual(agNoFollow.groups, [])
+  assert.equal(agNoFollow.submitWhenTyped, undefined)
+
+  // Zed 原生 agent 没有注入通道，测试卡不带输入框。
+  const zedTest = buildReturnTestPayload({ host: 'zed', hostLabel: 'Zed', settings: DEFAULT_SETTINGS })
+  assert.deepEqual(zedTest.groups, [])
 })
