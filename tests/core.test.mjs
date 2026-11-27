@@ -19,7 +19,7 @@ import {
 import * as antigravityMcpApp from '../adapters/antigravity/mcp-app.mjs'
 import * as dshAdapter from '../adapters/dsh/index.mjs'
 import { buildAcpPermissionPayload } from '../adapters/zed/acp-proxy.mjs'
-import { describeAgent, lastMessageKind, pickTurnCompletion, watchStatePath, watchTick } from '../adapters/zed/native-watch.mjs'
+import { describeAgent, lastMessageKind, pickTurnCompletion, shouldSkipForFocus, watchStatePath, watchTick } from '../adapters/zed/native-watch.mjs'
 import { createBridgeRequestHandler, encodeBridgeHelperPath, parseBridgeHelperPath, resolveBridgeTarget } from '../core/bridge.mjs'
 import { ensureHelper, parseHelperOutput } from '../core/helper.mjs'
 import { handleToolCall } from '../core/mcp.mjs'
@@ -989,4 +989,19 @@ test('zed native-watch: agent label covers native and external ACP threads', () 
   assert.equal(describeAgent({ model: null }), '')
   assert.equal(describeAgent({}), '')
   assert.equal(describeAgent(null), '')
+})
+
+test('zed native-watch: window-level focus decision', () => {
+  // 宿主不在前台：不跳过。
+  assert.equal(shouldSkipForFocus({ probe: { hostFrontmost: false, matched: true } }), false)
+  // 宿主在前台且前台窗口就是该会话窗口：跳过。
+  assert.equal(shouldSkipForFocus({ probe: { hostFrontmost: true, matched: true } }), true)
+  // 宿主在前台，但被同一 App 的另一个窗口盖住：照常弹卡。
+  assert.equal(shouldSkipForFocus({ probe: { hostFrontmost: true, matched: false } }), false)
+  // 拿不到窗口标题（无辅助功能权限）：退化为 App 级判断。
+  assert.equal(shouldSkipForFocus({ probe: { hostFrontmost: true } }), true)
+  // 探测失败：失败开放，宁可多弹一次。
+  assert.equal(shouldSkipForFocus({ probe: undefined }), false)
+  // 用户显式关闭 skipWhenHostFocused：一律不跳过。
+  assert.equal(shouldSkipForFocus({ skipWhenHostFocused: false, probe: { hostFrontmost: true, matched: true } }), false)
 })

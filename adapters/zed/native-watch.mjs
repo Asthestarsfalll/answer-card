@@ -27,8 +27,8 @@ import {
   createCardQueue,
   createTracer,
   ensureHelper,
-  isHostFocused,
   isMainModule,
+  probeHostWindow,
   showCard,
   withCardLock,
 } from '../../core/helper.mjs'
@@ -210,6 +210,22 @@ function writeState(file, state) {
 }
 
 /**
+ * 结合"App 是否前台"和"前台窗口是否就是该会话的窗口"判断是否跳过弹卡。
+ * 多窗口场景下，同一个 App 的另一个窗口在前台时不应视为聚焦（卡片照常弹）。
+ * @param {{ probe?: { hostFrontmost?: boolean, matched?: boolean }, skipWhenHostFocused?: boolean }} input
+ * @returns {boolean}
+ */
+export function shouldSkipForFocus(input) {
+  if (input.skipWhenHostFocused === false) return false
+  const probe = input.probe
+  // 探测失败时按"未聚焦"处理（失败开放：宁可多弹一次，也不要静默丢掉）。
+  if (!probe || typeof probe.hostFrontmost !== 'boolean') return false
+  if (!probe.hostFrontmost) return false
+  // App 在前台：只有前台窗口确实是该会话窗口才跳过；被别的窗口盖住则照常弹卡。
+  return probe.matched !== false
+}
+
+/**
  * 弹出完成卡；所有开关（总开关 / 静音 / 冷却 / 宿主前台）沿用共享设置。
  * @param {{ settingsFile: string, stateDir: string, trace: (msg: string) => void, queue: ReturnType<typeof createCardQueue> }} ctx
  * @param {string} threadId
@@ -222,14 +238,13 @@ async function fireCard(ctx, threadId, pending) {
   if (muteReasonOf({ sessionId: threadId, cwd: pending.cwd }, settings) !== null) return 'muted'
   const ensured = ensureHelper({ trace: ctx.trace })
   if (!ensured.ok) return 'unavailable'
-  // 前台判定放在冷却之前：宿主在前台时不算"已消费"，留给切走后的补发。
-  const focused = await isHostFocused({
-    helperPath: ensured.helperPath,
-    bundleIds: PROFILE.bundleIds,
-    processNames: PROFILE.processNames,
-    skipWhenHostFocused: settings.skipWhenHostFocused,
-  })
-  if (focused) return 'focused'
+  // 窗口标题形如 `RimOrbit — robot_io.py`，用项目目录名匹配最可靠。
+  const hints = [baseName(pending.cwd), pending.title].filter(Boolean)
+  // 前台判定放在冷却之前：被跳过时不算"已消费"。
+  const probe = settings.skipWhenHostFocused === false
+    ? undefined
+    : await probeHostWindow({ helperPath: ensured.helperPath, bundleIds: PROFILE.bundleIds, hints })
+  if (shouldSkipForFocus({ probe, skipWhenHostFocused: settings.skipWhenHostFocused })) return 'focused'
   if (isCoolingDown(`${HOST}:${threadId}`, Number(settings.completeCooldownMs ?? 10000), ctx.stateDir)) return 'cooldown'
   const payload = buildCompletePayload({
     host: HOST,
@@ -246,8 +261,7 @@ async function fireCard(ctx, threadId, pending) {
     helperPath: ensured.helperPath,
     bundleIds: PROFILE.bundleIds,
     processNames: PROFILE.processNames,
-    // Zed 窗口标题形如 `RimOrbit — robot_io.py`，用项目目录名匹配最可靠。
-    windowHints: [baseName(pending.cwd), pending.title].filter(Boolean),
+    windowHints: hints,
     returnCommand: settings.returnCommand,
     warpPointer: settings.warpPointer,
     context: { host: HOST, sessionId: threadId, cwd: pending.cwd, title: pending.title },
@@ -337,7 +351,7 @@ export async function watchTick(ctx) {
     const status = await fire(ctx, threadId, pending)
     if (status === 'focused') {
       // 宿主在前台：用户此刻就在看对话，不再延迟补发，直接丢弃避免过期卡片。
-      note(ctx, `drop thread=${threadId} reason=host_focused`)
+      process.stdout.write(`${new Date().toISOString()} [skip] thread=${threadId} reason=host_focused title=${JSON.stringify(pending.title)}\n`)
       delete state.pending[threadId]
       changed = true
       continue

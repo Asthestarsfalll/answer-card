@@ -1550,6 +1550,45 @@ if CommandLine.arguments.contains("--activate") {
     ])
 }
 
+// 只读判断宿主 App 是否真的"看着"目标窗口：App 在前台 + 前台窗口标题命中 hint。
+// 用于多窗口场景：同一 App 的另一个窗口在前台时，不应视为"宿主在前台"。
+if CommandLine.arguments.contains("--check-window") {
+    let rawBundles = flagValue("--check-window") ?? ""
+    let bundles = rawBundles.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    let rawHints = flagValue("--window-hint") ?? ""
+    let hints = rawHints.split(separator: "|").map { String($0).trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+
+    let front = NSWorkspace.shared.frontmostApplication
+    let frontBundle = front?.bundleIdentifier ?? ""
+    let hostFrontmost = bundles.contains { $0.caseInsensitiveCompare(frontBundle) == .orderedSame }
+
+    var windowTitle = ""
+    var matchedWindow = false
+    if hostFrontmost, let pid = front?.processIdentifier, AXIsProcessTrusted() {
+        let appEl = AXUIElementCreateApplication(pid)
+        var winObj: AnyObject?
+        if AXUIElementCopyAttributeValue(appEl, kAXFocusedWindowAttribute as CFString, &winObj) != .success {
+            AXUIElementCopyAttributeValue(appEl, kAXMainWindowAttribute as CFString, &winObj)
+        }
+        if let winObject = winObj, CFGetTypeID(winObject) == AXUIElementGetTypeID() {
+            let win = winObject as! AXUIElement
+            var titleObj: AnyObject?
+            if AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleObj) == .success,
+               let title = titleObj as? String {
+                windowTitle = title
+                let lower = title.lowercased()
+                matchedWindow = hints.isEmpty || hints.contains { lower.contains($0.lowercased()) }
+            }
+        }
+    }
+    emit([
+        "hostFrontmost": hostFrontmost,
+        "frontBundleId": frontBundle,
+        "windowTitle": windowTitle,
+        "matched": matchedWindow,
+    ])
+}
+
 if CommandLine.arguments.contains("--probe") {
     let front = NSWorkspace.shared.frontmostApplication
     emit([

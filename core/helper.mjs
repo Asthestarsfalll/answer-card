@@ -220,6 +220,41 @@ export async function isHostFocused(options) {
 }
 
 /**
+ * 只读探测宿主是否真的"看着"目标窗口：App 在前台，且前台窗口标题命中任一 hint。
+ * 多窗口场景下（同一个 App 被另一个窗口覆盖）不会被误判为聚焦。
+ * @param {{ helperPath: string, bundleIds?: string[], hints?: string[] }} options
+ * @returns {Promise<{ hostFrontmost?: boolean, matched?: boolean, windowTitle?: string, frontBundleId?: string } | undefined>}
+ */
+export function probeHostWindow(options) {
+  const bundles = (options.bundleIds ?? []).map((item) => String(item || '')).filter(Boolean)
+  if (bundles.length === 0) return Promise.resolve(undefined)
+  const hints = (options.hints ?? [])
+    .map((hint) => String(hint || '').replace(/\|/g, ' ').trim())
+    .filter(Boolean)
+  const args = ['--check-window', bundles.join(',')]
+  if (hints.length > 0) args.push('--window-hint', hints.join('|'))
+  return new Promise((resolve) => {
+    let child
+    try {
+      child = spawn(options.helperPath, args, { stdio: ['ignore', 'pipe', 'ignore'] })
+    } catch {
+      resolve(undefined)
+      return
+    }
+    let output = ''
+    child.stdout?.on('data', (chunk) => { output += String(chunk) })
+    child.once('error', () => resolve(undefined))
+    child.once('exit', () => {
+      try {
+        resolve(JSON.parse(output.trim()))
+      } catch {
+        resolve(undefined)
+      }
+    })
+  })
+}
+
+/**
  * 激活宿主应用并可选精准切到对应窗口与移动鼠标指针；若设置了 `returnCommand` 则只执行自定义命令（注入会话环境变量）。
  * @param {{
  *   helperPath: string,
