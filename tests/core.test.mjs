@@ -2,7 +2,9 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
+import { zstdCompressSync } from 'node:zlib'
 
 import {
   approvalRuleKey,
@@ -17,6 +19,7 @@ import {
 import * as antigravityMcpApp from '../adapters/antigravity/mcp-app.mjs'
 import * as dshAdapter from '../adapters/dsh/index.mjs'
 import { buildAcpPermissionPayload } from '../adapters/zed/acp-proxy.mjs'
+import { describeAgent, lastMessageKind, pickTurnCompletion, watchStatePath, watchTick } from '../adapters/zed/native-watch.mjs'
 import { createBridgeRequestHandler, encodeBridgeHelperPath, parseBridgeHelperPath, resolveBridgeTarget } from '../core/bridge.mjs'
 import { ensureHelper, parseHelperOutput } from '../core/helper.mjs'
 import { handleToolCall } from '../core/mcp.mjs'
@@ -817,4 +820,173 @@ test('bridge: auto target detection, Bearer auth, local theme merge, and safe ac
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('zed native-watch: turn completion detection, focus drop, and dedupe', async () => {
+  const dir = makeTmpDir()
+  try {
+    assert.equal(pickTurnCompletion({ messages: [] }), null)
+    assert.equal(pickTurnCompletion({ messages: [{ User: { id: 'u1', content: 'hi' } }] }), null)
+    assert.equal(lastMessageKind({ messages: [{ User: { id: 'u1', content: 'hi' } }] }), 'user')
+    assert.equal(lastMessageKind({ messages: [{ Agent: { content: [], tool_results: {} } }] }), 'agent')
+    // Zed 把 Text 序列化成字符串。
+    assert.deepEqual(
+      pickTurnCompletion({ messages: [{ Agent: { content: [{ Thinking: { text: '嗯' } }, { Text: 'done' }], tool_results: {} } }] }),
+      { messageCount: 1, text: 'done' },
+    )
+    // 兼容 { Text: { text } } 形式。
+    assert.deepEqual(
+      pickTurnCompletion({ messages: [{ Agent: { content: [{ Text: { text: 'obj' } }], tool_results: {} } }] }),
+      { messageCount: 1, text: 'obj' },
+    )
+    // 工具没回填结果 → 回合未结束。
+    assert.equal(pickTurnCompletion({ messages: [{ Agent: { content: [{ ToolUse: { id: 't1' } }], tool_results: {} } }] }), null)
+    // 工具已回填但最后一项是 ToolUse → 回合仍会继续。
+    assert.equal(pickTurnCompletion({ messages: [{ Agent: { content: [{ Text: 'hi' }, { ToolUse: { id: 't1' } }], tool_results: { t1: {} } } }] }), null)
+
+    const dbPath = join(dir, 'threads.db')
+    const db = new DatabaseSync(dbPath)
+    db.exec('create table threads (id text primary key, parent_id text, summary text, updated_at text, folder_paths text, data blob)')
+    const upsert = db.prepare('insert or replace into threads (id, parent_id, summary, updated_at, folder_paths, data) values (?, ?, ?, ?, ?, ?)')
+    const encode = (thread) => zstdCompressSync(Buffer.from(JSON.stringify(thread), 'utf8'))
+    const ctx = {
+      dbPath,
+      settingsFile: join(dir, 'settings.json'),
+      stateDir: join(dir, 'state'),
+      intervalMs: 0,
+      quietMs: 60000,
+      dryRun: false,
+      trace: () => {},
+      queue: { enqueue: async (fn) => fn() },
+      fire: async () => 'focused',
+    }
+    const stateFile = watchStatePath(ctx.stateDir)
+    const readPending = () => JSON.parse(readFileSync(stateFile, 'utf8')).pending
+    const completed = {
+      messages: [
+        { User: { id: 'u1', content: 'go' } },
+        { Agent: { content: [{ Thinking: { text: '想' } }, { Text: '完成了' }], tool_results: {} } },
+      ],
+    }
+
+    upsert.run('t-1', null, 'Demo', '2026-01-01T00:00:00Z', '/tmp/project', encode({ messages: [{ User: { id: 'u1', content: 'go' } }] }))
+    await watchTick(ctx)
+    assert.deepEqual(readPending(), {})
+
+    upsert.run('t-1', null, 'Demo', '2026-01-01T00:00:05Z', '/tmp/project', encode(completed))
+    await watchTick(ctx)
+    assert.equal(readPending()['t-1'].text, '完成了')
+
+    // 同一回合被再次落库（滚动位置、标题等写回）不能丢掉候选。
+    upsert.run('t-1', null, 'Demo', '2026-01-01T00:00:09Z', '/tmp/project', encode(completed))
+    await watchTick(ctx)
+    assert.equal(readPending()['t-1'].text, '完成了')
+
+    // 宿主在前台：直接丢弃，不延迟补发（避免过期卡片）。
+    ctx.quietMs = 0
+    await watchTick(ctx)
+    assert.deepEqual(readPending(), {})
+
+    // 新回合完成且宿主不在前台时，立即消费并弹卡。
+    ctx.quietMs = 60000
+    const secondTurn = {
+      messages: [...completed.messages, { Agent: { content: [{ Text: '第二轮完成' }], tool_results: {} } }],
+    }
+    upsert.run('t-1', null, 'Demo', '2026-01-01T00:01:00Z', '/tmp/project', encode(secondTurn))
+    await watchTick(ctx)
+    assert.equal(readPending()['t-1'].text, '第二轮完成')
+    ctx.fire = async () => 'shown'
+    ctx.quietMs = 0
+    await watchTick(ctx)
+    assert.deepEqual(readPending(), {})
+
+    // 用户发出新消息时，残留候选立即作废。
+    ctx.fire = async () => 'focused'
+    ctx.quietMs = 60000
+    const thirdTurn = {
+      messages: [...secondTurn.messages, { Agent: { content: [{ Text: '第三轮完成' }], tool_results: {} } }],
+    }
+    upsert.run('t-1', null, 'Demo', '2026-01-01T00:02:00Z', '/tmp/project', encode(thirdTurn))
+    await watchTick(ctx)
+    assert.equal(readPending()['t-1'].text, '第三轮完成')
+
+    upsert.run('t-1', null, 'Demo', '2026-01-01T00:02:10Z', '/tmp/project', encode({
+      messages: [...thirdTurn.messages, { User: { id: 'u2', content: '下一件事' } }],
+    }))
+    await watchTick(ctx)
+    assert.deepEqual(readPending(), {})
+    db.close()
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('zed native-watch: subagent threads and odd message entries are ignored', async () => {
+  const dir = makeTmpDir()
+  try {
+    const dbPath = join(dir, 'threads.db')
+    const db = new DatabaseSync(dbPath)
+    db.exec('create table threads (id text primary key, parent_id text, summary text, updated_at text, folder_paths text, data blob)')
+    const upsert = db.prepare('insert or replace into threads (id, parent_id, summary, updated_at, folder_paths, data) values (?, ?, ?, ?, ?, ?)')
+    const encode = (thread) => zstdCompressSync(Buffer.from(JSON.stringify(thread), 'utf8'))
+    const ctx = {
+      dbPath,
+      settingsFile: join(dir, 'settings.json'),
+      stateDir: join(dir, 'state'),
+      intervalMs: 0,
+      quietMs: 60000,
+      dryRun: false,
+      trace: () => {},
+      queue: { enqueue: async (fn) => fn() },
+      fire: async () => 'focused',
+    }
+    const readPending = () => JSON.parse(readFileSync(watchStatePath(ctx.stateDir), 'utf8')).pending
+
+    upsert.run('parent', null, 'Parent', '2026-01-01T00:00:00Z', '/tmp/p', encode({ messages: [{ User: { id: 'u1', content: 'go' } }] }))
+    await watchTick(ctx)
+
+    // 子 agent 会话完成不应弹卡。
+    upsert.run('child', 'parent', 'Sub', '2026-01-01T00:00:05Z', '/tmp/p', encode({
+      messages: [
+        { User: { id: 's1', content: 'sub' } },
+        { Agent: { content: [{ Thinking: { text: '想' } }, { Text: '子任务完成' }], tool_results: {} } },
+      ],
+    }))
+    await watchTick(ctx)
+    assert.deepEqual(readPending(), {})
+
+    // messages 里可能混入字符串项（Zed 会写 "Resume"），不能因此报错。
+    const withResume = {
+      model: { provider: 'rimbot', model: 'Flash' },
+      messages: [
+        { User: { id: 'u1', content: 'go' } },
+        'Resume',
+        { Agent: { content: [{ Text: '混入脏项也正常' }], tool_results: {} } },
+      ],
+    }
+    upsert.run('parent', null, 'Parent', '2026-01-01T00:00:10Z', '/tmp/p', encode(withResume))
+    await watchTick(ctx)
+    assert.equal(readPending().parent.text, '混入脏项也正常')
+    assert.equal(readPending().parent.agent, 'rimbot/Flash')
+
+    // 最后一条是 Compaction 时不视为回合完成。
+    upsert.run('parent', null, 'Parent', '2026-01-01T00:00:15Z', '/tmp/p', encode({
+      messages: [...withResume.messages, { Compaction: {} }],
+    }))
+    await watchTick(ctx)
+    assert.deepEqual(readPending(), {})
+    db.close()
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('zed native-watch: agent label covers native and external ACP threads', () => {
+  assert.equal(describeAgent({ model: { provider: 'rimbot', model: 'Flash' } }), 'rimbot/Flash')
+  assert.equal(describeAgent({ model: { provider: 'acp:antigravity-acp', model: 'gemini' } }), 'acp:antigravity-acp/gemini')
+  assert.equal(describeAgent({ model: { provider: 'claude-code' } }), 'claude-code')
+  // 外部 Agent 的会话可能没有 model 字段。
+  assert.equal(describeAgent({ model: null }), '')
+  assert.equal(describeAgent({}), '')
+  assert.equal(describeAgent(null), '')
 })
