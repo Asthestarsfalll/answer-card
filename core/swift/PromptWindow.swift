@@ -821,6 +821,11 @@ final class CardController: NSObject, NSApplicationDelegate {
     private func handleKeyDown(_ event: NSEvent) -> NSEvent? {
         let editingText = isEditingTextInput()
         let mods = event.modifierFlags.intersection([.command, .control, .option])
+        // 非输入态：按不按 ⌘ 都生效（仅排除 ⌃/⌥ 组合，避免抢占系统级快捷键与特殊字符输入）；
+        // 输入态：必须带 ⌘，否则按键应当作为普通文字输入。
+        let shortcutAllowed = editingText
+            ? mods.contains(.command)
+            : (!mods.contains(.control) && !mods.contains(.option))
 
         // Esc：输入态先退出输入框焦点；非输入态关闭卡片。
         if event.keyCode == 53 {
@@ -832,40 +837,33 @@ final class CardController: NSObject, NSApplicationDelegate {
             return nil
         }
 
-        // Return：非输入态直接按 ⏎ 提交；输入态按 ⌘⏎ 提交（普通 ⏎ 换行）。
+        // Return：非输入态直接按 ⏎（或 ⌘⏎）提交；输入态按 ⌘⏎ 提交，普通 ⏎ 换行。
         if event.keyCode == 36 || event.keyCode == 76 {
-            if mods.contains(.command) || (!editingText && mods.isEmpty) {
+            if shortcutAllowed {
                 submitTapped()
                 return nil
             }
             return event
         }
 
-        // 数字键 1–9：非输入态直接按 1–9，输入态加 ⌘ 前缀（⌘1–⌘9）选中/取消选项或聚焦输入框。
-        if let digit = digitFromEvent(event), let target = hotkeyTargets[digit] {
-            let allowDirect = !editingText && mods.isEmpty
-            let allowCmd = editingText && mods == .command
-            if allowDirect || allowCmd {
-                switch target {
-                case let .choice(group, choice):
-                    if editingText { window?.makeFirstResponder(nil) }
-                    toggle(group: group, choice: choice)
-                case let .input(groupId):
-                    textFields[groupId]?.focusEditor()
-                }
-                return nil
+        // 数字键 1–9：非输入态按 1–9 或 ⌘1–⌘9 均生效；输入态需 ⌘1–⌘9。
+        if shortcutAllowed, let digit = digitFromEvent(event), let target = hotkeyTargets[digit] {
+            switch target {
+            case let .choice(group, choice):
+                if editingText { window?.makeFirstResponder(nil) }
+                toggle(group: group, choice: choice)
+            case let .input(groupId):
+                textFields[groupId]?.focusEditor()
             }
+            return nil
         }
 
-        // E：非输入态直接按 E，输入态加 ⌘ 前缀（⌘E）切换展开 / 收起（keyCode 14 = E）。
+        // E：非输入态按 E 或 ⌘E 均可切换展开；输入态需 ⌘E（keyCode 14 = E）。
         if canExpand,
+           shortcutAllowed,
            (event.keyCode == 14 || event.charactersIgnoringModifiers?.lowercased() == "e") {
-            let allowDirect = !editingText && mods.isEmpty
-            let allowCmd = editingText && mods == .command
-            if allowDirect || allowCmd {
-                toggleExpand()
-                return nil
-            }
+            toggleExpand()
+            return nil
         }
 
         return event
