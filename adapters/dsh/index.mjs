@@ -53,6 +53,20 @@ import { resolveHostTheme, writeHostThemeSnapshot } from '../../core/theme.mjs'
 
 export { parseHelperOutput, shorten }
 
+/**
+ * 把卡片里输入的追问交给 DSH agent，开一个新回合；不抢焦点、不切换窗口。
+ * @param {{ followup?: (input: { content: Array<{ type: string, text: string }>, source: { kind: string } }) => void } | null} agent
+ * @param {string} text
+ * @returns {boolean} 是否已成功投递
+ */
+export function sendFollowUp(agent, text) {
+  const content = String(text ?? '').trim()
+  if (content.length === 0) return false
+  if (typeof agent?.followup !== 'function') return false
+  agent.followup({ content: [{ type: 'text', text: content }], source: { kind: 'user' } })
+  return true
+}
+
 export const name = 'answer-card'
 export const inject = []
 
@@ -332,11 +346,13 @@ export function apply(ctx, rawConfig = {}) {
 
     const completeTitle = titleOf(ctx, agent)
     const completeCwd = typeof agent?.session?.header?.cwd === 'string' ? agent.session.header.cwd : ''
+    // DSH 的 agent 句柄支持 followup()，完成卡直接带追问输入框（无需回到界面）。
     const payload = buildCompletePayload({
       host: 'dsh',
       hostLabel: HOST_PROFILES.dsh.shortName,
       title: completeTitle,
       settings: settings(),
+      allowFollowUp: true,
     })
     const sessionId = typeof agent?.session?.id === 'string' ? agent.session.id : ''
     ;(async () => {
@@ -347,6 +363,22 @@ export function apply(ctx, rawConfig = {}) {
       }
       const outcome = await runCard(payload)
       if (outcome.result === 'choose') {
+        const followUp = String(outcome.texts?.followup ?? (outcome.answers?.followup?.[0] ?? '')).trim()
+        // 卡片里写了追问：直接让 agent 开新一轮，不抢焦点、不切换窗口。
+        if (followUp.length > 0) {
+          let sent = false
+          try {
+            sent = sendFollowUp(agent, followUp)
+          } catch (error) {
+            trace(`complete: follow-up failed ${String(error)}`)
+          }
+          if (sent) {
+            trace(`complete: follow-up queued chars=${followUp.length}`)
+            trace('complete: closed (follow-up)')
+            return
+          }
+          trace('complete: follow-up unavailable, falling back to activate')
+        }
         const custom = String(settings().returnCommand ?? '').trim()
         pendingFocus = custom.length === 0 && sessionId.length > 0 ? { sessionId, at: Date.now() } : null
         trace(`complete: open DSH session=${sessionId || 'none'}${custom.length > 0 ? ' (custom command)' : ''}`)

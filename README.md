@@ -29,7 +29,7 @@ A host-agnostic macOS always-on-top floating card for AI coding agents (**Antigr
 
 - **审批代答**：工具请求权限时后台弹卡，支持「允许一次 / 本次会话允许 / 总是允许 / 拒绝」以及直接输入拒绝原因或替代指令；Antigravity 自动附带 `permissionOverrides` 避免原生二次弹窗，点「稍后处理」无损交回宿主原生界面。
 - **提问与多题作答**：支持单选、多选、自由文本以及选项 + 补充说明；单选聚焦输入框自动取消已选项，多题支持部分作答提交。
-- **完成提醒 & 直接追问**：回合结束后后台弹卡；留空确认一键激活宿主并按标题关键词拉起对应窗口（支持多窗口），Antigravity 支持在完成卡里直接输入追问续跑下一轮。
+- **完成提醒 & 直接追问**：回合结束后后台弹卡；留空确认一键激活宿主并按标题关键词拉起对应窗口（支持多窗口）；Antigravity 与 DSH 支持在完成卡里直接输入追问续跑下一轮（Antigravity 走 `decision: continue`，DSH 走 `agent.followup()`，都不需要切回界面）。
 - **动态主题自适应**：自动跟随当前 Agent 实时浅/深配色——Antigravity 通过 MCP App `hostContext` 同步、DSH 同步实时样式、Zed 自动读取 `settings.json` 与已安装扩展主题（兼容 Blur 透明主题）。
 - **跨宿主统一可视化设置页**：三端共享同一套 `<answer-card-settings>` Web Component（Antigravity 内置侧边栏/全页 MCP App、DSH 插件设置分区、Zed 本地设置页），所有配置统一存入 `~/.config/answer-card/settings.json`（共享层 + 按宿主覆写层）。
 - **完整键盘操作 & Markdown 渲染**：支持数字键选择/取消/聚焦、`⌘` 组合键在输入态触发、常驻 `展开 E` / `收起 E` 且展开自动防溢出屏幕、正文 Markdown（含行内代码/可点击链接）划选与 `⌘C` 复制。

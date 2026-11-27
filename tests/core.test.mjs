@@ -1005,3 +1005,29 @@ test('zed native-watch: window-level focus decision', () => {
   // 用户显式关闭 skipWhenHostFocused：一律不跳过。
   assert.equal(shouldSkipForFocus({ skipWhenHostFocused: false, probe: { hostFrontmost: true, matched: true } }), false)
 })
+
+test('dsh: completion card queues follow-up on the agent handle', () => {
+  const payload = buildCompletePayload({
+    host: 'dsh',
+    hostLabel: 'DSH',
+    title: 'Demo',
+    settings: DEFAULT_SETTINGS,
+    allowFollowUp: true,
+  })
+  assert.equal(payload.groups[0]?.id, 'followup')
+  assert.equal(payload.groups[0]?.input, true)
+  assert.equal(payload.submitWhenTyped, '发送到 DSH')
+
+  const calls = []
+  const agent = { followup: (input) => calls.push(input) }
+  assert.equal(dshAdapter.sendFollowUp(agent, '  继续看看测试  '), true)
+  assert.deepEqual(calls, [{ content: [{ type: 'text', text: '继续看看测试' }], source: { kind: 'user' } }])
+
+  // 空白输入不投递。
+  assert.equal(dshAdapter.sendFollowUp(agent, '   '), false)
+  assert.equal(calls.length, 1)
+
+  // 句柄不支持 followup 时返回 false，调用方回退为激活窗口。
+  assert.equal(dshAdapter.sendFollowUp({}, 'x'), false)
+  assert.equal(dshAdapter.sendFollowUp(null, 'x'), false)
+})
