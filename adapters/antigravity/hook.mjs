@@ -278,20 +278,20 @@ export function describeToolCall(toolCall) {
     if (cmd) lines.push(`\`${cmd.replace(/`/g, '\'')}\``)
     return {
       toolLabel: 'run_command',
-      reason: shortenMultiline(lines.join('\n'), 2000),
+      reason: shortenMultiline(lines.join('\n'), 4000),
     }
   }
   if (name === 'call_mcp_tool') {
     const label = [args.ServerName, args.ToolName].filter(Boolean).join('/') || 'call_mcp_tool'
     const argText = args.Arguments && Object.keys(args.Arguments).length > 0
-      ? shortenMultiline(JSON.stringify(args.Arguments, null, 2), 1200)
+      ? shortenMultiline(JSON.stringify(args.Arguments, null, 2), 2400)
       : undefined
     return { toolLabel: `MCP: ${label}`, reason: argText }
   }
   if (name === 'write_file' || name === 'edit_file') {
-    return { toolLabel: name, reason: shorten(args.Path, 240) }
+    return { toolLabel: name, reason: shorten(args.Path, 480) }
   }
-  return { toolLabel: name, reason: shortenMultiline(JSON.stringify(args, null, 2), 1200) }
+  return { toolLabel: name, reason: shortenMultiline(JSON.stringify(args, null, 2), 2400) }
 }
 
 /**
@@ -367,7 +367,7 @@ function readLastAssistantSnippet(transcriptPath) {
         const entry = JSON.parse(line)
         const text = entry?.text ?? entry?.content ?? entry?.message?.content ?? entry?.response
         if (typeof text === 'string' && text.trim().length > 0) {
-          return shortenMultiline(text, 4000)
+          return shortenMultiline(text, 8000)
         }
       } catch {
         // 跳过半截行或非 JSON 行。
@@ -585,7 +585,7 @@ export async function handleHookInput(input, deps = {}) {
 
     const isError = input?.terminationReason === 'ERROR'
     const message = isError
-      ? shorten(input?.error, 240)
+      ? shorten(input?.error, 480)
       : readLastAssistantSnippet(input?.transcriptPath)
 
     const payload = buildCompletePayload({

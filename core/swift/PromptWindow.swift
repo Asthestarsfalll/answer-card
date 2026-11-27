@@ -117,7 +117,29 @@ func flagValue(_ flag: String) -> String? {
     return value.hasPrefix("--") ? nil : value
 }
 
+func hasTextTable(_ attr: NSAttributedString) -> Bool {
+    var found = false
+    attr.enumerateAttribute(.paragraphStyle, in: NSRange(location: 0, length: attr.length), options: []) { value, _, stop in
+        if let para = value as? NSParagraphStyle, !para.textBlocks.isEmpty {
+            found = true
+            stop.pointee = true
+        }
+    }
+    return found
+}
+
 func measureAttributed(_ attr: NSAttributedString, width: CGFloat) -> CGFloat {
+    if hasTextTable(attr) {
+        let storage = NSTextStorage(attributedString: attr)
+        let manager = NSLayoutManager()
+        let container = NSTextContainer(size: NSSize(width: width, height: .greatestFiniteMagnitude))
+        container.lineFragmentPadding = 0
+        manager.addTextContainer(container)
+        storage.addLayoutManager(manager)
+        manager.ensureLayout(for: container)
+        let used = manager.usedRect(for: container)
+        return ceil(used.height) + 4
+    }
     let rect = attr.boundingRect(
         with: NSSize(width: width, height: .greatestFiniteMagnitude),
         options: [.usesLineFragmentOrigin, .usesFontLeading]
@@ -125,7 +147,132 @@ func measureAttributed(_ attr: NSAttributedString, width: CGFloat) -> CGFloat {
     return ceil(rect.height) + 2
 }
 
-/// 轻量 Markdown 渲染：支持标题、无序列表、**加粗**、*斜体*、`行内代码` 与 [链接](url)。
+private let markdownInlineRegex = try? NSRegularExpression(
+    pattern: #"(``[^`\n]*(?:`[^`\n]+`[^`\n]*)*``|`[^`\n]+`|\*\*[^*\n]+?\*\*|__[^_\n]+?__|\[[^\]\n]+\]\([^)\n]+\)|(?<!\*)\*[^*\n]+?\*(?!\*))"#
+)
+
+private func appendInlineMarkdown(
+    _ line: String,
+    to target: NSMutableAttributedString,
+    para: NSParagraphStyle,
+    lineSize: CGFloat,
+    baseFont: NSFont,
+    boldFont: NSFont,
+    italicFont: NSFont,
+    codeFont: NSFont,
+    textColor: NSColor,
+    secondaryColor: NSColor,
+    codeBg: NSColor,
+    accentColor: NSColor
+) {
+    let baseAttrs: [NSAttributedString.Key: Any] = [
+        .font: baseFont,
+        .foregroundColor: textColor,
+        .paragraphStyle: para,
+    ]
+    guard let regex = markdownInlineRegex else {
+        target.append(NSAttributedString(string: line, attributes: baseAttrs))
+        return
+    }
+    let nsLine = line as NSString
+    let matches = regex.matches(in: line, range: NSRange(location: 0, length: nsLine.length))
+    var cursor = 0
+    for match in matches {
+        if match.range.location > cursor {
+            let plain = nsLine.substring(with: NSRange(location: cursor, length: match.range.location - cursor))
+            target.append(NSAttributedString(string: plain, attributes: baseAttrs))
+        }
+        let token = nsLine.substring(with: match.range)
+        if token.hasPrefix("``"), token.hasSuffix("``"), token.count >= 4 {
+            var inner = String(token.dropFirst(2).dropLast(2))
+            if inner.hasPrefix(" "), inner.hasSuffix(" "), inner.count >= 2 {
+                inner = String(inner.dropFirst().dropLast())
+            }
+            target.append(NSAttributedString(string: " \(inner) ", attributes: [
+                .font: codeFont,
+                .foregroundColor: textColor,
+                .backgroundColor: codeBg,
+                .paragraphStyle: para,
+            ]))
+        } else if token.hasPrefix("`"), token.hasSuffix("`"), token.count >= 2 {
+            let inner = String(token.dropFirst().dropLast())
+            target.append(NSAttributedString(string: " \(inner) ", attributes: [
+                .font: codeFont,
+                .foregroundColor: textColor,
+                .backgroundColor: codeBg,
+                .paragraphStyle: para,
+            ]))
+        } else if (token.hasPrefix("**") && token.hasSuffix("**")) || (token.hasPrefix("__") && token.hasSuffix("__")), token.count >= 4 {
+            let inner = String(token.dropFirst(2).dropLast(2))
+            target.append(NSAttributedString(string: inner, attributes: [
+                .font: boldFont,
+                .foregroundColor: textColor,
+                .paragraphStyle: para,
+            ]))
+        } else if token.hasPrefix("["), let sep = token.range(of: "]("), token.hasSuffix(")") {
+            let linkText = String(token[token.index(after: token.startIndex)..<sep.lowerBound])
+            let urlStart = sep.upperBound
+            let urlEnd = token.index(before: token.endIndex)
+            let urlStr = String(token[urlStart..<urlEnd])
+            var attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: lineSize, weight: .medium),
+                .foregroundColor: accentColor,
+                .underlineStyle: NSUnderlineStyle.single.rawValue,
+                .paragraphStyle: para,
+            ]
+            if let url = URL(string: urlStr), url.scheme == "http" || url.scheme == "https" || url.scheme == "file" {
+                attrs[.link] = url
+            }
+            target.append(NSAttributedString(string: linkText, attributes: attrs))
+        } else if token.hasPrefix("*"), token.hasSuffix("*"), token.count >= 2 {
+            let inner = String(token.dropFirst().dropLast())
+            target.append(NSAttributedString(string: inner, attributes: [
+                .font: italicFont,
+                .foregroundColor: secondaryColor,
+                .paragraphStyle: para,
+            ]))
+        } else {
+            target.append(NSAttributedString(string: token, attributes: baseAttrs))
+        }
+        cursor = match.range.location + match.range.length
+    }
+    if cursor < nsLine.length {
+        target.append(NSAttributedString(string: nsLine.substring(from: cursor), attributes: baseAttrs))
+    }
+}
+
+private func splitMarkdownTableRow(_ line: String) -> [String] {
+    var trimmed = line.trimmingCharacters(in: .whitespaces)
+    if trimmed.hasPrefix("|") { trimmed.removeFirst() }
+    if trimmed.hasSuffix("|") { trimmed.removeLast() }
+    return trimmed.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+}
+
+private func parseTableAlignments(_ separatorLine: String) -> [NSTextAlignment]? {
+    guard separatorLine.contains("|") else { return nil }
+    let cells = splitMarkdownTableRow(separatorLine)
+    guard !cells.isEmpty else { return nil }
+    var alignments: [NSTextAlignment] = []
+    for cell in cells {
+        guard cell.range(of: #"^:?-{1,}:?$"#, options: .regularExpression) != nil else { return nil }
+        if cell.hasPrefix(":") && cell.hasSuffix(":") {
+            alignments.append(.center)
+        } else if cell.hasSuffix(":") {
+            alignments.append(.right)
+        } else {
+            alignments.append(.left)
+        }
+    }
+    return alignments
+}
+
+private func isHorizontalRuleLine(_ line: String) -> Bool {
+    let trimmed = line.trimmingCharacters(in: .whitespaces)
+    if trimmed == "--" { return true }
+    return trimmed.range(of: #"^([-*_])(?:\s*\1){2,}$"#, options: .regularExpression) != nil
+}
+
+/// 轻量 Markdown 渲染：支持标题、无序列表、分割线、表格、**加粗**、*斜体*、`行内代码` 与 [链接](url)。
 func renderMarkdown(
     _ raw: String,
     fontSize: CGFloat,
@@ -134,20 +281,131 @@ func renderMarkdown(
     secondaryColor: NSColor,
     codeBg: NSColor,
     accentColor: NSColor,
-    lineSpacing: CGFloat = 4
+    lineSpacing: CGFloat = 4,
+    contentWidth: CGFloat = 320
 ) -> NSAttributedString {
     let result = NSMutableAttributedString()
     let lines = raw.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
-    let inlinePattern = try? NSRegularExpression(
-        pattern: #"(``[^`\n]*(?:`[^`\n]+`[^`\n]*)*``|`[^`\n]+`|\*\*[^*\n]+?\*\*|__[^_\n]+?__|\[[^\]\n]+\]\([^)\n]+\)|(?<!\*)\*[^*\n]+?\*(?!\*))"#
-    )
+    var lineIdx = 0
 
-    for (lineIdx, originalLine) in lines.enumerated() {
+    while lineIdx < lines.count {
+        let originalLine = lines[lineIdx]
+
+        // 1. 表格块：当前行含 `|`，下一行为 `| --- | --- |` 分隔行
+        if lineIdx + 1 < lines.count,
+           originalLine.contains("|"),
+           let alignments = parseTableAlignments(lines[lineIdx + 1]) {
+            let headerCells = splitMarkdownTableRow(originalLine)
+            let colCount = max(headerCells.count, alignments.count)
+            var rows: [[String]] = [headerCells]
+            var rowCursor = lineIdx + 2
+            while rowCursor < lines.count {
+                let rowLine = lines[rowCursor]
+                if rowLine.trimmingCharacters(in: .whitespaces).isEmpty || !rowLine.contains("|") {
+                    break
+                }
+                rows.append(splitMarkdownTableRow(rowLine))
+                rowCursor += 1
+            }
+
+            let table = NSTextTable()
+            table.numberOfColumns = colCount
+            table.collapsesBorders = true
+            table.hidesEmptyCells = false
+            let borderCol = secondaryColor.withAlphaComponent(0.28)
+            let tableFontSize = max(11, fontSize - 0.6)
+            let bodyFont = NSFont.systemFont(ofSize: tableFontSize, weight: baseWeight)
+            let headerFont = NSFont.systemFont(ofSize: tableFontSize, weight: .semibold)
+            let boldFont = NSFont.systemFont(ofSize: tableFontSize, weight: .semibold)
+            let italicFont = NSFontManager.shared.convert(bodyFont, toHaveTrait: .italicFontMask)
+            let codeFont = NSFont.monospacedSystemFont(ofSize: max(10, tableFontSize - 1), weight: .regular)
+
+            for (rIdx, row) in rows.enumerated() {
+                let isHeader = rIdx == 0
+                for cIdx in 0..<colCount {
+                    let cellText = cIdx < row.count ? row[cIdx] : ""
+                    let block = NSTextTableBlock(
+                        table: table,
+                        startingRow: rIdx,
+                        rowSpan: 1,
+                        startingColumn: cIdx,
+                        columnSpan: 1
+                    )
+                    block.setBorderColor(borderCol)
+                    block.setWidth(0.5, type: .absoluteValueType, for: .border)
+                    block.setWidth(4, type: .absoluteValueType, for: .padding, edge: .minY)
+                    block.setWidth(4, type: .absoluteValueType, for: .padding, edge: .maxY)
+                    block.setWidth(7, type: .absoluteValueType, for: .padding, edge: .minX)
+                    block.setWidth(7, type: .absoluteValueType, for: .padding, edge: .maxX)
+                    if isHeader {
+                        block.backgroundColor = codeBg
+                    } else if rIdx % 2 == 1 {
+                        block.backgroundColor = secondaryColor.withAlphaComponent(0.04)
+                    }
+
+                    let cellPara = NSMutableParagraphStyle()
+                    cellPara.textBlocks = [block]
+                    cellPara.alignment = cIdx < alignments.count ? alignments[cIdx] : .left
+                    cellPara.lineBreakMode = .byWordWrapping
+                    cellPara.lineSpacing = 2
+
+                    let cellAttr = NSMutableAttributedString()
+                    let cellBaseFont = isHeader ? headerFont : bodyFont
+                    appendInlineMarkdown(
+                        cellText,
+                        to: cellAttr,
+                        para: cellPara,
+                        lineSize: tableFontSize,
+                        baseFont: cellBaseFont,
+                        boldFont: boldFont,
+                        italicFont: italicFont,
+                        codeFont: codeFont,
+                        textColor: textColor,
+                        secondaryColor: secondaryColor,
+                        codeBg: codeBg,
+                        accentColor: accentColor
+                    )
+                    cellAttr.append(NSAttributedString(string: "\n", attributes: [
+                        .font: cellBaseFont,
+                        .paragraphStyle: cellPara,
+                    ]))
+                    result.append(cellAttr)
+                }
+            }
+
+            lineIdx = rowCursor
+            continue
+        }
+
+        // 2. 分割线：--- / *** / ___ / --
+        if isHorizontalRuleLine(originalLine) {
+            let hrPara = NSMutableParagraphStyle()
+            hrPara.paragraphSpacingBefore = 4
+            hrPara.paragraphSpacing = 6
+            let hrWidth = max(120, contentWidth)
+            let hrImage = NSImage(size: NSSize(width: hrWidth, height: 1))
+            hrImage.lockFocus()
+            secondaryColor.withAlphaComponent(0.28).setFill()
+            NSRect(x: 0, y: 0, width: hrWidth, height: 1).fill()
+            hrImage.unlockFocus()
+            let attachment = NSTextAttachment()
+            attachment.image = hrImage
+            attachment.bounds = CGRect(x: 0, y: 3, width: hrWidth, height: 1)
+            let hrAttr = NSMutableAttributedString(attachment: attachment)
+            hrAttr.addAttributes([.paragraphStyle: hrPara], range: NSRange(location: 0, length: hrAttr.length))
+            if lineIdx < lines.count - 1 {
+                hrAttr.append(NSAttributedString(string: "\n", attributes: [.paragraphStyle: hrPara]))
+            }
+            result.append(hrAttr)
+            lineIdx += 1
+            continue
+        }
+
+        // 3. 普通行 / 标题 / 无序列表
         var line = originalLine
         var isHeading = false
         var isBullet = false
 
-        // 处理 ### 标题
         if let range = line.range(of: #"^\s*#{1,6}\s+"#, options: .regularExpression) {
             line.removeSubrange(range)
             isHeading = true
@@ -172,12 +430,6 @@ func renderMarkdown(
         let italicFont = NSFontManager.shared.convert(baseFont, toHaveTrait: .italicFontMask)
         let codeFont = NSFont.monospacedSystemFont(ofSize: max(10, lineSize - 1), weight: .regular)
 
-        let baseAttrs: [NSAttributedString.Key: Any] = [
-            .font: baseFont,
-            .foregroundColor: textColor,
-            .paragraphStyle: para,
-        ]
-
         let lineAttr = NSMutableAttributedString()
         if isBullet {
             lineAttr.append(NSAttributedString(string: "•  ", attributes: [
@@ -187,86 +439,49 @@ func renderMarkdown(
             ]))
         }
 
-        if let regex = inlinePattern {
-            let nsLine = line as NSString
-            let matches = regex.matches(in: line, range: NSRange(location: 0, length: nsLine.length))
-            var cursor = 0
-            for match in matches {
-                if match.range.location > cursor {
-                    let plain = nsLine.substring(with: NSRange(location: cursor, length: match.range.location - cursor))
-                    lineAttr.append(NSAttributedString(string: plain, attributes: baseAttrs))
-                }
-                let token = nsLine.substring(with: match.range)
-                if token.hasPrefix("``"), token.hasSuffix("``"), token.count >= 4 {
-                    var inner = String(token.dropFirst(2).dropLast(2))
-                    if inner.hasPrefix(" "), inner.hasSuffix(" "), inner.count >= 2 {
-                        inner = String(inner.dropFirst().dropLast())
-                    }
-                    lineAttr.append(NSAttributedString(string: " \(inner) ", attributes: [
-                        .font: codeFont,
-                        .foregroundColor: textColor,
-                        .backgroundColor: codeBg,
-                        .paragraphStyle: para,
-                    ]))
-                } else if token.hasPrefix("`"), token.hasSuffix("`"), token.count >= 2 {
-                    let inner = String(token.dropFirst().dropLast())
-                    lineAttr.append(NSAttributedString(string: " \(inner) ", attributes: [
-                        .font: codeFont,
-                        .foregroundColor: textColor,
-                        .backgroundColor: codeBg,
-                        .paragraphStyle: para,
-                    ]))
-                } else if (token.hasPrefix("**") && token.hasSuffix("**")) || (token.hasPrefix("__") && token.hasSuffix("__")), token.count >= 4 {
-                    let inner = String(token.dropFirst(2).dropLast(2))
-                    lineAttr.append(NSAttributedString(string: inner, attributes: [
-                        .font: boldFont,
-                        .foregroundColor: textColor,
-                        .paragraphStyle: para,
-                    ]))
-                } else if token.hasPrefix("["), let sep = token.range(of: "]("), token.hasSuffix(")") {
-                    let linkText = String(token[token.index(after: token.startIndex)..<sep.lowerBound])
-                    let urlStart = sep.upperBound
-                    let urlEnd = token.index(before: token.endIndex)
-                    let urlStr = String(token[urlStart..<urlEnd])
-                    var attrs: [NSAttributedString.Key: Any] = [
-                        .font: NSFont.systemFont(ofSize: lineSize, weight: .medium),
-                        .foregroundColor: accentColor,
-                        .underlineStyle: NSUnderlineStyle.single.rawValue,
-                        .paragraphStyle: para,
-                    ]
-                    if let url = URL(string: urlStr), url.scheme == "http" || url.scheme == "https" || url.scheme == "file" {
-                        attrs[.link] = url
-                    }
-                    lineAttr.append(NSAttributedString(string: linkText, attributes: attrs))
-                } else if token.hasPrefix("*"), token.hasSuffix("*"), token.count >= 2 {
-                    let inner = String(token.dropFirst().dropLast())
-                    lineAttr.append(NSAttributedString(string: inner, attributes: [
-                        .font: italicFont,
-                        .foregroundColor: secondaryColor,
-                        .paragraphStyle: para,
-                    ]))
-                } else {
-                    lineAttr.append(NSAttributedString(string: token, attributes: baseAttrs))
-                }
-                cursor = match.range.location + match.range.length
-            }
-            if cursor < nsLine.length {
-                lineAttr.append(NSAttributedString(string: nsLine.substring(from: cursor), attributes: baseAttrs))
-            }
-        } else {
-            lineAttr.append(NSAttributedString(string: line, attributes: baseAttrs))
-        }
+        appendInlineMarkdown(
+            line,
+            to: lineAttr,
+            para: para,
+            lineSize: lineSize,
+            baseFont: baseFont,
+            boldFont: boldFont,
+            italicFont: italicFont,
+            codeFont: codeFont,
+            textColor: textColor,
+            secondaryColor: secondaryColor,
+            codeBg: codeBg,
+            accentColor: accentColor
+        )
 
         if lineIdx < lines.count - 1 {
-            lineAttr.append(NSAttributedString(string: "\n", attributes: baseAttrs))
+            lineAttr.append(NSAttributedString(string: "\n", attributes: [
+                .font: baseFont,
+                .foregroundColor: textColor,
+                .paragraphStyle: para,
+            ]))
         }
         result.append(lineAttr)
+        lineIdx += 1
     }
 
     return result
 }
 
-func attributedLabel(_ attr: NSAttributedString, width: CGFloat, lines: Int = 0) -> NSTextField {
+func attributedLabel(_ attr: NSAttributedString, width: CGFloat, lines: Int = 0) -> NSView {
+    if lines == 0 && hasTextTable(attr) {
+        let height = measureAttributed(attr, width: width)
+        let view = NSTextView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        view.isEditable = false
+        view.isSelectable = true
+        view.drawsBackground = false
+        view.textContainerInset = .zero
+        view.textContainer?.lineFragmentPadding = 0
+        view.textContainer?.widthTracksTextView = true
+        view.linkTextAttributes = [:]
+        view.textStorage?.setAttributedString(attr)
+        return view
+    }
     let field = NSTextField(wrappingLabelWithString: "")
     field.allowsEditingTextAttributes = true
     field.attributedStringValue = attr
@@ -915,7 +1130,7 @@ final class CardController: NSObject, NSApplicationDelegate {
         return color(payload.theme?.textSecondary, fallback: fallback)
     }
 
-    private func md(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular, textColor: NSColor) -> NSAttributedString {
+    private func md(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular, textColor: NSColor, width: CGFloat = 320) -> NSAttributedString {
         renderMarkdown(
             text,
             fontSize: size * scale,
@@ -924,7 +1139,8 @@ final class CardController: NSObject, NSApplicationDelegate {
             secondaryColor: secondaryTextColor,
             codeBg: surfaceColor,
             accentColor: color(payload.accent),
-            lineSpacing: 4 * scale
+            lineSpacing: 4 * scale,
+            contentWidth: width
         )
     }
 
@@ -962,11 +1178,11 @@ final class CardController: NSObject, NSApplicationDelegate {
         }
 
         let kickerWidth = max(120, content - 84)
-        let titleAttr = md(payload.title, size: 15.5, weight: .semibold, textColor: primaryTextColor)
-        let subtitleAttr = payload.subtitle.flatMap { $0.isEmpty ? nil : md($0, size: 12, textColor: secondaryTextColor) }
-        let messageAttr = payload.message.flatMap { $0.isEmpty ? nil : md($0, size: 12.8, textColor: primaryTextColor.withAlphaComponent(0.88)) }
-        let groupTextAttrs = groups.map { $0.text.isEmpty ? nil : md($0.text, size: 13.5, weight: .medium, textColor: primaryTextColor) }
-        let groupDetailAttrs = groups.map { $0.detail.flatMap { d in d.isEmpty ? nil : md(d, size: 12, textColor: secondaryTextColor) } }
+        let titleAttr = md(payload.title, size: 15.5, weight: .semibold, textColor: primaryTextColor, width: content)
+        let subtitleAttr = payload.subtitle.flatMap { $0.isEmpty ? nil : md($0, size: 12, textColor: secondaryTextColor, width: content) }
+        let messageAttr = payload.message.flatMap { $0.isEmpty ? nil : md($0, size: 12.8, textColor: primaryTextColor.withAlphaComponent(0.88), width: content) }
+        let groupTextAttrs = groups.map { $0.text.isEmpty ? nil : md($0.text, size: 13.5, weight: .medium, textColor: primaryTextColor, width: content) }
+        let groupDetailAttrs = groups.map { $0.detail.flatMap { d in d.isEmpty ? nil : md(d, size: 12, textColor: secondaryTextColor, width: content) } }
 
         var estimatedHeight = pad
         if let kicker = payload.kicker, !kicker.isEmpty {

@@ -14,7 +14,7 @@ import { resolveHostTheme } from './theme.mjs'
  * @param {number} [limit]
  * @returns {string | undefined}
  */
-export function shorten(text, limit = 420) {
+export function shorten(text, limit = 840) {
   if (typeof text !== 'string') return undefined
   const flat = text.replace(/\s+/g, ' ').trim()
   if (flat.length === 0) return undefined
@@ -27,7 +27,7 @@ export function shorten(text, limit = 420) {
  * @param {number} [limit]
  * @returns {string | undefined}
  */
-export function shortenMultiline(text, limit = 420) {
+export function shortenMultiline(text, limit = 840) {
   if (typeof text !== 'string') return undefined
   const cleaned = text
     .replace(/\r\n?/g, '\n')
@@ -101,7 +101,7 @@ export function buildApprovalPayload({
   inputPlaceholder,
   settings,
 }) {
-  const detail = shortenMultiline(reason, 2000)
+  const detail = shortenMultiline(reason, 4000)
   const resolvedChoices = Array.isArray(choices) && choices.length > 0
     ? choices
     : [
@@ -150,7 +150,7 @@ export function buildQuestionPayload({ host, hostLabel, title, questions, settin
     return {
       id,
       text: header.length > 0 ? `${header}｜${text}` : text,
-      detail: shortenMultiline(question?.detail, 2000),
+      detail: shortenMultiline(question?.detail, 4000),
       multi: question?.multiSelect === true,
       input: options.length === 0,
       choices: options.map((option, optionIndex) => {
@@ -252,7 +252,7 @@ export function buildCompletePayload({ host, hostLabel, title, message, subtitle
     kicker: `${hostLabel} · 已完成`,
     title,
     subtitle,
-    message: shortenMultiline(message, 4000),
+    message: shortenMultiline(message, 8000),
     groups,
     submit: `回到 ${hostLabel}`,
     ...(allowFollowUp ? { submitWhenTyped: `发送到 ${hostLabel}` } : {}),
